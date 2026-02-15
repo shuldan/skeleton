@@ -1,0 +1,3 @@
+### Получить все задачи
+GET {{BASE_URL}}/api/v1/tasks
+Accept: application/json

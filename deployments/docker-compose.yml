@@ -1,0 +1,94 @@
+networks:
+  frontend:
+    driver: ${NETWORKS_DRIVER:-bridge}
+  backend:
+    driver: ${NETWORKS_DRIVER:-bridge}
+
+volumes:
+  pgdata:
+    driver: ${VOLUMES_DRIVER:-local}
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────
+  postgres:
+    build:
+      context: docker/postgres
+      args:
+        - POSTGRES_VERSION=${POSTGRES_VERSION:-16-alpine}
+    command: postgres -c 'max_connections=${POSTGRES_MAX_CONNECTIONS:-200}'
+    volumes:
+      - ${DATA_PATH_HOST:-./docker/.data}/postgres:/var/lib/postgresql/data
+      - ${POSTGRES_ENTRYPOINT_INITDB:-./docker/postgres/docker-entrypoint-initdb.d}:/docker-entrypoint-initdb.d
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-skeleton}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+
+  # ── Migrate ─────────────────────────────────────────────
+  migrate:
+    build:
+      context: ${APP_CODE_PATH_HOST:-..}
+      dockerfile: deployments/Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    command: ["migrate:up"]
+    networks:
+      - backend
+
+  # ── App (HTTP) ──────────────────────────────────────────
+  app:
+    build:
+      context: ${APP_CODE_PATH_HOST:-..}
+      dockerfile: deployments/Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    command: ["serve"]
+    restart: unless-stopped
+    networks:
+      - backend
+      - frontend
+
+  # ── Worker (queue) ──────────────────────────────────────
+  worker:
+    build:
+      context: ${APP_CODE_PATH_HOST:-..}
+      dockerfile: deployments/Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    command: ["queue:work"]
+    restart: unless-stopped
+    networks:
+      - backend

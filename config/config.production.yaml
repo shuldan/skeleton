@@ -1,0 +1,10 @@
+server:
+  port: 443
+
+database:
+  connections:
+    default:
+      max_open_conns: 100
+
+log:
+  level: warn

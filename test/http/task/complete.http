@@ -1,0 +1,16 @@
+### Завершить задачу
+POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
+Accept: application/json
+
+### Ошибка — повторное завершение (done → done)
+# Выполнить после первого complete — должен вернуть ошибку перехода статуса
+POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
+Accept: application/json
+
+### Ошибка — несуществующая задача
+POST {{BASE_URL}}/api/v1/tasks/00000000-0000-0000-0000-000000000000/complete
+Accept: application/json
+
+### Ошибка — невалидный UUID
+POST {{BASE_URL}}/api/v1/tasks/bad-id/complete
+Accept: application/json

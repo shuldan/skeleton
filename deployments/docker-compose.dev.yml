@@ -1,0 +1,65 @@
+services:
+  # ── Dev-контейнер (вместо production app) ───────────────
+  app:
+    build:
+      context: docker/golang
+      dockerfile: Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+        - PUID=${GOLANG_PUID:-1000}
+        - PGID=${GOLANG_PGID:-1000}
+        - USER=${GOLANG_USER:-appuser}
+        - TZ=${GOLANG_TIMEZONE:-UTC}
+    tty: true
+    volumes:
+      - ${APP_CODE_PATH_HOST:-..}:${APP_CODE_PATH_CONTAINER:-/usr/app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    command: ["go", "run", "./cmd/app", "serve"]
+    networks:
+      - backend
+      - frontend
+
+  # ── Dev-worker ──────────────────────────────────────────
+  worker:
+    build:
+      context: docker/golang
+      dockerfile: Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+        - PUID=${GOLANG_PUID:-1000}
+        - PGID=${GOLANG_PGID:-1000}
+        - USER=${GOLANG_USER:-appuser}
+        - TZ=${GOLANG_TIMEZONE:-UTC}
+    tty: true
+    volumes:
+      - ${APP_CODE_PATH_HOST:-..}:${APP_CODE_PATH_CONTAINER:-/usr/app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    command: ["go", "run", "./cmd/app", "queue:work"]
+    networks:
+      - backend
+
+  # ── Migrate (dev) ───────────────────────────────────────
+  migrate:
+    build:
+      context: docker/golang
+      dockerfile: Dockerfile
+      args:
+        - GO_VERSION=${GO_VERSION:-1.25-alpine}
+    volumes:
+      - ${APP_CODE_PATH_HOST:-..}:${APP_CODE_PATH_CONTAINER:-/usr/app}
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skeleton}?sslmode=disable
+    command: ["go", "run", "./cmd/app", "migrate:up"]

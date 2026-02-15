@@ -1,0 +1,29 @@
+app:
+  name: skeleton
+  version: 0.1.0
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  read_timeout: 15s
+  write_timeout: 15s
+  idle_timeout: 60s
+
+database:
+  connections:
+    default:
+      driver: postgres
+      dsn: "{{ env \"DATABASE_URL\" | default \"postgres://postgres:postgres@localhost:5432/skeleton?sslmode=disable\" }}"
+      max_open_conns: 25
+      max_idle_conns: 5
+      conn_max_lifetime: 5m
+
+events:
+  async: true
+  workers: 4
+  buffer_size: 128
+
+log:
+  level: info
+  format: json
+  output: stdout

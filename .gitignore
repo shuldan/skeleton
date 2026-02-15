@@ -26,7 +26,14 @@ go.work.sum
 
 # env file
 .env
+deployments/.env
+
+# Docker data
+deployments/docker/.data/
+
+# HTTP client private env (содержит токены, пароли)
+test/http/http-client.private.env.json
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/

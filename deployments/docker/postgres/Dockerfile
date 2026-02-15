@@ -1,0 +1,6 @@
+ARG POSTGRES_VERSION=16-alpine
+FROM postgres:${POSTGRES_VERSION}
+
+CMD ["postgres"]
+
+EXPOSE 5432

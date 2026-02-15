@@ -1,0 +1,48 @@
+### Создать задачу — минимальный запрос
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "Купить молоко",
+  "description": ""
+}
+
+### Создать задачу — с описанием
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "Настроить CI/CD",
+  "description": "Добавить GitHub Actions: lint, test, build, deploy"
+}
+
+### Создать задачу — с длинным описанием
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "Рефакторинг модуля авторизации",
+  "description": "Перевести на JWT, добавить refresh-токены, настроить expiration. Обновить middleware и тесты."
+}
+
+### Ошибка валидации — пустой title
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "",
+  "description": "Задача без заголовка"
+}
+
+### Ошибка валидации — title из пробелов
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "   ",
+  "description": ""
+}
+
+### Ошибка — пустое тело
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json

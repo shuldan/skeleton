@@ -1,0 +1,139 @@
+### ═══════════════════════════════════════════════════════
+### Полный сценарий: создание → получение → завершение
+### ═══════════════════════════════════════════════════════
+
+### 1. Список задач (пустой)
+GET {{BASE_URL}}/api/v1/tasks
+Accept: application/json
+
+> {%
+    client.test("Ответ 200", function () {
+        client.assert(response.status === 200, "Expected 200");
+    });
+    client.test("Пустой список", function () {
+        client.assert(response.body.tasks.length >= 0);
+    });
+%}
+
+### 2. Создать первую задачу
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "Первая задача",
+  "description": "Описание первой задачи"
+}
+
+> {%
+    client.test("Ответ 201", function () {
+        client.assert(response.status === 201, "Expected 201");
+    });
+    client.test("Статус draft", function () {
+        client.assert(response.body.status === "draft");
+    });
+    client.test("Версия 1", function () {
+        client.assert(response.body.version === 1);
+    });
+    client.global.set("TASK_ID", response.body.id);
+    client.log("Created task: " + response.body.id);
+%}
+
+### 3. Создать вторую задачу
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "Вторая задача",
+  "description": ""
+}
+
+> {%
+    client.test("Ответ 201", function () {
+        client.assert(response.status === 201);
+    });
+    client.global.set("TASK_ID_2", response.body.id);
+%}
+
+### 4. Список задач (2 штуки)
+GET {{BASE_URL}}/api/v1/tasks
+Accept: application/json
+
+> {%
+    client.test("Минимум 2 задачи", function () {
+        client.assert(response.body.tasks.length >= 2);
+    });
+%}
+
+### 5. Получить первую задачу по ID
+GET {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}
+Accept: application/json
+
+> {%
+    client.test("Ответ 200", function () {
+        client.assert(response.status === 200);
+    });
+    client.test("Корректный ID", function () {
+        client.assert(response.body.id === client.global.get("TASK_ID"));
+    });
+    client.test("Статус draft", function () {
+        client.assert(response.body.status === "draft");
+    });
+%}
+
+### 6. Завершить первую задачу
+POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
+Accept: application/json
+
+> {%
+    client.test("Ответ 200", function () {
+        client.assert(response.status === 200);
+    });
+    client.test("Статус done", function () {
+        client.assert(response.body.status === "done");
+    });
+%}
+
+### 7. Проверить что статус сохранился
+GET {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}
+Accept: application/json
+
+> {%
+    client.test("Статус done после перезапроса", function () {
+        client.assert(response.body.status === "done");
+    });
+%}
+
+### 8. Повторное завершение — ошибка
+POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
+Accept: application/json
+
+> {%
+    client.test("Ошибка перехода статуса", function () {
+        client.assert(response.status >= 400, "Expected error status");
+    });
+%}
+
+### 9. Несуществующая задача — 404
+GET {{BASE_URL}}/api/v1/tasks/00000000-0000-0000-0000-000000000000
+Accept: application/json
+
+> {%
+    client.test("Not found", function () {
+        client.assert(response.status === 404);
+    });
+%}
+
+### 10. Невалидный title — ошибка валидации
+POST {{BASE_URL}}/api/v1/tasks
+Content-Type: application/json
+
+{
+  "title": "",
+  "description": "no title"
+}
+
+> {%
+    client.test("Validation error", function () {
+        client.assert(response.status >= 400);
+    });
+%}

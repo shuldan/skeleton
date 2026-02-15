@@ -1,0 +1,11 @@
+### Получить задачу по ID
+GET {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}
+Accept: application/json
+
+### Ошибка — несуществующий ID
+GET {{BASE_URL}}/api/v1/tasks/00000000-0000-0000-0000-000000000000
+Accept: application/json
+
+### Ошибка — невалидный UUID
+GET {{BASE_URL}}/api/v1/tasks/not-a-uuid
+Accept: application/json

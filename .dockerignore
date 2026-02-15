@@ -1,0 +1,36 @@
+# VCS
+.git
+.gitignore
+
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment
+.env
+
+# Deployment configs (не нужны внутри контекста повторно)
+deployments/docker/
+deployments/.env*
+deployments/docker-compose*.yml
+
+# Docs / misc
+README.md
+LICENSE
+test/
