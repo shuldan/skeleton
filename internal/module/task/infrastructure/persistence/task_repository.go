@@ -13,7 +13,7 @@ import (
 
 var taskTable = repository.Table{
 	Name:          "tasks",
-	PrimaryKey:    "id",
+	PrimaryKey:    []string{"id"},
 	Columns:       []string{"id", "title", "description", "status", "version"},
 	VersionColumn: "version",
 	CreatedAt:     "created_at",

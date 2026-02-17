@@ -12,10 +12,10 @@ require (
 	github.com/shuldan/framework v0.0.0-20260215141839-9d0ec160aa76
 	github.com/shuldan/migrator v0.0.0-20260214200019-5f1dd22ba11b
 	github.com/shuldan/queue v0.0.0-20260215005300-4609d6fa3ad8
-	github.com/shuldan/repository v0.0.0-20260214010935-a747f12cbeb7
+	github.com/shuldan/repository v0.0.0-20260217225240-6a677eb1717c
 )
 
 require (
-	github.com/goccy/go-yaml v1.18.0 // indirect
+	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/shuldan/app v0.0.0-20260214215613-1dae55f6dd83 // indirect
 )
