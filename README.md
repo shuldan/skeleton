@@ -3,7 +3,7 @@
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**Skeleton** — `gonew`-совместимый шаблон Go-приложения с модульной DDD-архитектурой, встроенной системой событий, очередями, миграциями и Docker-окружением. Содержит один модуль (`task`) в качестве примера — удалите или замените его на свой домен.
+**Skeleton** — `gonew`-совместимый шаблон Go-приложения с модульной DDD-архитектурой, встроенной системой событий, командной шиной, очередями, миграциями и Docker-окружением. Содержит два модуля (`task` и `payment`) в качестве примера — удалите или замените их на свой домен.
 
 ---
 
@@ -14,6 +14,7 @@
   - [Высокоуровневая схема](#высокоуровневая-схема)
   - [Поток запроса](#поток-запроса)
   - [Система событий](#система-событий)
+  - [Командная шина](#командная-шина)
   - [Принципы](#принципы)
 - [Структура проекта](#структура-проекта)
 - [Анатомия модуля](#анатомия-модуля)
@@ -38,6 +39,16 @@
   - [Listener (подписка)](#listener-подписка)
   - [OutboundRelay (пересылка в очередь)](#outboundrelay-пересылка-в-очередь)
   - [Полный цикл события в task-модуле](#полный-цикл-события-в-task-модуле)
+- [Командная шина (Command Bus)](#командная-шина-command-bus)
+  - [Обзор](#обзор)
+  - [Определение команд и результатов](#определение-команд-и-результатов)
+  - [CommandSender (отправка)](#commandsender-отправка)
+  - [CommandReceiver (обработка)](#commandreceiver-обработка)
+  - [ReplyListener (получение результатов)](#replylistener-получение-результатов)
+  - [Регистрация в bootstrap](#регистрация-в-bootstrap)
+  - [Полный цикл команды](#полный-цикл-команды)
+  - [Идемпотентность](#идемпотентность)
+  - [Когда использовать Command Bus vs Events](#когда-использовать-command-bus-vs-events)
 - [Очереди](#очереди)
 - [HTTP-сервер](#http-сервер)
   - [Маршрутизация](#маршрутизация)
@@ -96,6 +107,12 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 
 # Список задач
 curl http://localhost:8080/api/v1/tasks
+
+# Завершить задачу (→ автоматически создаст invoice через Command Bus)
+curl -X POST http://localhost:8080/api/v1/tasks/{id}/complete
+
+# Проверить созданные счета
+curl http://localhost:8080/api/v1/invoices
 ```
 
 ---
@@ -112,12 +129,12 @@ graph TB
     CLI --> BS
     
     BS --> M1["module/task<br/><i>пример</i>"]
-    BS --> M2["module/order<br/><i>ваш код</i>"]
+    BS --> M2["module/payment<br/><i>пример</i>"]
     BS --> M3["module/...<br/><i>ваш код</i>"]
 
     subgraph module["Структура модуля"]
         direction TB
-        PR["presentation<br/>HTTP, Listeners, Jobs"]
+        PR["presentation<br/>HTTP, Listeners, Jobs,<br/>Command Handlers"]
         AP["application<br/>Interactors, Operations,<br/>Emitters, Ports"]
         DM["domain<br/>Models, Value Objects,<br/>Interfaces"]
         IN["infrastructure<br/>Repositories, Adapters,<br/>Migrations"]
@@ -129,12 +146,23 @@ graph TB
 
     M1 -.-> module
 
+    subgraph communication["Межмодульное взаимодействие"]
+        EVT["Events<br/><i>уведомления</i>"]
+        CMD["Command Bus<br/><i>запрос-ответ</i>"]
+    end
+
+    M1 --> EVT
+    M1 --> CMD
+    CMD --> M2
+    EVT --> M2
+
     style CLI fill:#e1f5fe
     style BS fill:#e1f5fe
     style DM fill:#fff3e0
     style AP fill:#e8f5e9
     style PR fill:#f3e5f5
     style IN fill:#fce4ec
+    style communication fill:#f5f5f5
 ```
 
 ### Поток запроса
@@ -181,8 +209,11 @@ graph LR
     
     DISP --> L1["Listener<br/><i>in-process</i>"]
     DISP --> RELAY["OutboundRelay"]
+    DISP --> CMDSEND["CommandSender<br/><i>→ Command Bus</i>"]
     RELAY --> BROKER["Broker<br/><i>memory / redis / ...</i>"]
+    CMDSEND --> BROKER
     BROKER --> JOB["Job / Consumer<br/><i>async worker</i>"]
+    BROKER --> CMDRECV["CommandReceiver<br/><i>другой модуль</i>"]
 
     style AGG fill:#fff3e0
     style INT fill:#e8f5e9
@@ -190,6 +221,8 @@ graph LR
     style L1 fill:#f3e5f5
     style BROKER fill:#e1f5fe
     style JOB fill:#fce4ec
+    style CMDSEND fill:#e8eaf6
+    style CMDRECV fill:#e8eaf6
 ```
 
 **Поток событий:**
@@ -197,8 +230,52 @@ graph LR
 1. Агрегат **накапливает** события через `record()` при изменении состояния
 2. Interactor вызывает `task.ReleaseEvents()` — забирает и очищает очередь
 3. Emitter итерирует по слайсу и публикует каждое событие в Dispatcher
-4. Dispatcher доставляет события в Listener (in-process) и OutboundRelay (→ очередь)
-5. Job/Consumer читает из очереди и обрабатывает асинхронно
+4. Dispatcher доставляет события в:
+   - **Listener** (in-process обработка)
+   - **OutboundRelay** (→ очередь для async consumers)
+   - **CommandSender** (→ Command Bus для межмодульных команд)
+5. Job/Consumer и CommandReceiver читают из очереди и обрабатывают асинхронно
+
+### Командная шина
+
+```mermaid
+graph LR
+    subgraph "Модуль-отправитель (task)"
+        EVT["TaskCompleted<br/><i>событие</i>"]
+        CS["CommandSender"]
+    end
+    
+    EVT --> CS
+    CS -->|"Command Envelope"| BRK["Broker<br/><i>queue topic</i>"]
+    
+    subgraph "Модуль-получатель (payment)"
+        CR["CommandReceiver"]
+        CH["CommandHandler"]
+        INTER["Interactor"]
+    end
+    
+    BRK --> CR
+    CR --> CH
+    CH --> INTER
+    INTER -->|"Result"| CR
+    CR -->|"Reply Envelope"| BRK
+    
+    subgraph "Модуль-отправитель (task)"
+        RL["ReplyListener"]
+        RH["ReplyHandler"]
+    end
+    
+    BRK --> RL
+    RL --> RH
+
+    style EVT fill:#fff3e0
+    style CS fill:#e8eaf6
+    style BRK fill:#e1f5fe
+    style CR fill:#e8eaf6
+    style CH fill:#f3e5f5
+    style RL fill:#e8eaf6
+    style RH fill:#f3e5f5
+```
 
 ### Принципы
 
@@ -211,6 +288,7 @@ graph LR
 | **Snapshot-паттерн** | Персистентность через плоские снимки агрегата, без экспорта приватных полей |
 | **CQRS-lite** | Разделение операций записи (operations/interactors) и чтения |
 | **Event-Driven** | Агрегат накапливает события → emitter публикует пакетом → relay пересылает в очередь |
+| **Command Bus** | Межмодульное взаимодействие через команды с гарантированной доставкой и ответом |
 | **Structural typing** | Модули определяют свой `Logger` интерфейс, совместимый с `framework/logger` без импорта |
 
 ---
@@ -233,6 +311,9 @@ skeleton/
 │   │   ├── app.go                   # Инициализация: ядро, БД, модули, команды
 │   │   └── router.go                # Сборка HTTP-маршрутизатора
 │   │
+│   ├── command/
+│   │   └── invoice.go               # Определения команд и результатов (Command Bus)
+│   │
 │   ├── event/
 │   │   ├── event.go                 # Интерфейс Event (доменная граница)
 │   │   └── task.go                  # Глобальные определения событий
@@ -241,12 +322,24 @@ skeleton/
 │   │   └── logger.go                # Интерфейс Logger (structural typing)
 │   │
 │   └── module/
-│       └── task/                    # ── Пример модуля ──
-│           ├── module.go            # Фасад: Routes, Listeners, Consumers, Migrations
-│           ├── domain/              # Ядро бизнес-логики
-│           ├── application/         # Use-case оркестрация
-│           ├── infrastructure/      # Реализации интерфейсов
-│           └── presentation/        # HTTP, listeners, jobs
+│       ├── task/                     # ── Модуль Task (отправитель команд) ──
+│       │   ├── module.go            # Фасад: Routes, Listeners, CommandSenders, etc.
+│       │   ├── domain/
+│       │   ├── application/
+│       │   ├── infrastructure/
+│       │   └── presentation/
+│       │       ├── api/             # HTTP handlers
+│       │       ├── listener/        # Event listeners + CommandSender + ReplyHandler
+│       │       └── job/             # Queue consumers
+│       │
+│       └── payment/                  # ── Модуль Payment (получатель команд) ──
+│           ├── module.go            # Фасад: Routes, CommandHandlers, Migrations
+│           ├── domain/
+│           ├── application/
+│           ├── infrastructure/
+│           └── presentation/
+│               ├── api/             # HTTP handlers
+│               └── commandhandler/  # Command Bus handlers
 │
 ├── deployments/
 │   ├── .env.example
@@ -279,7 +372,7 @@ graph TB
 
         subgraph presentation
             API["api/<br/>HTTP handlers"]
-            LST["listener/<br/>event handlers"]
+            LST["listener/<br/>event handlers +<br/>command senders +<br/>reply handlers"]
             JOB["job/<br/>queue consumers"]
         end
 
@@ -475,13 +568,13 @@ func (i *CreateTaskInteractor) Handle(
         return err
     }
 
-    task.RepresentTo(output)              // заполнение output через presenter
     i.emitter.Emit(ctx, task.ReleaseEvents())  // публикация пакета событий
+    task.RepresentTo(output)                    // заполнение output через presenter
     return nil
 }
 ```
 
-> **Порядок:** сначала `RepresentTo` (данные для ответа), затем `ReleaseEvents` + `Emit` (публикация событий). События публикуются только после успешного сохранения в Operation.
+> **Порядок:** сначала `ReleaseEvents` + `Emit` (публикация событий), затем `RepresentTo` (данные для ответа). События публикуются только после успешного сохранения в Operation.
 
 **Operation** — изолированная бизнес-операция (запись в репозиторий):
 
@@ -581,7 +674,7 @@ func (r *taskRepository) FindByID(ctx context.Context, id model.TaskID) (*model.
 
 ### Presentation
 
-Адаптеры ввода: HTTP, event listeners, queue consumers.
+Адаптеры ввода: HTTP, event listeners, command handlers, queue consumers.
 
 ```
 presentation/
@@ -592,7 +685,11 @@ presentation/
 │   ├── complete_task_handler.go   # POST /api/v1/tasks/{id}/complete
 │   └── errors.go                  # API-специфичные ошибки
 ├── listener/
-│   └── task_completed_listener.go # In-process обработка TaskCompleted
+│   ├── task_completed_listener.go         # In-process обработка TaskCompleted
+│   ├── task_completed_command_sender.go   # Отправка CreateInvoice через Command Bus
+│   └── invoice_created_reply_handler.go   # Обработка результата CreateInvoice
+├── commandhandler/                        # (в модуле payment)
+│   └── create_invoice_handler.go          # Обработка команды CreateInvoice
 └── job/
     └── send_notification_job.go   # Queue consumer: отправка уведомлений
 ```
@@ -631,8 +728,19 @@ func NewModule(db *sql.DB, dispatcher *events.Dispatcher, log logger.Logger) *Mo
 // Регистрация компонентов — вызываются из bootstrap
 func (m *Module) Routes(router *httpserver.Router)
 func (m *Module) Listeners(d *events.Dispatcher)
+func (m *Module) CommandSenders(d *events.Dispatcher, sender *commandbus.CommandSender)
+func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener)
 func (m *Module) Relays(relay *eventbus.OutboundRelay)
 func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker)
+func (m *Module) Migrations(runner *migration.Runner)
+```
+
+Для модулей-получателей команд (payment):
+
+```go
+func NewModule(db *sql.DB, log logger.Logger) *Module
+func (m *Module) Routes(router *httpserver.Router)
+func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver)
 func (m *Module) Migrations(runner *migration.Runner)
 ```
 
@@ -829,12 +937,15 @@ graph LR
         REL --> EM["Emitter<br/>[]event.Event"]
         EM --> DISP["Dispatcher"]
         DISP --> LST["Listener"]
+        DISP --> CMDSND["CommandSender"]
     end
 
     subgraph "Асинхронно (через очередь)"
         DISP --> RLY["OutboundRelay"]
-        RLY --> BRK["Broker"]
+        CMDSND --> BRK["Broker"]
+        RLY --> BRK
         BRK --> JOB["Job"]
+        BRK --> CMDRCV["CommandReceiver"]
     end
 
     style AGG fill:#fff3e0
@@ -843,6 +954,8 @@ graph LR
     style LST fill:#f3e5f5
     style BRK fill:#e1f5fe
     style JOB fill:#fce4ec
+    style CMDSND fill:#e8eaf6
+    style CMDRCV fill:#e8eaf6
 ```
 
 ### Определение событий
@@ -1008,30 +1121,466 @@ sequenceDiagram
     participant E as Emitter
     participant D as Dispatcher
     participant L as Listener (in-process)
+    participant CS as CommandSender
     participant RL as OutboundRelay
     participant B as Broker
+    participant CR as CommandReceiver
     participant J as Job (async)
     participant N as NotificationPort
 
     H->>I: Handle(ctx, input, output)
-    I->>O: Create(ctx, title, desc)
-    O->>T: NewTask() → record(TaskCreated)
+    I->>O: Complete(ctx, taskID)
+    O->>T: task.Complete() → record(TaskCompleted)
     O->>R: Save(task)
     R-->>O: ok
     O-->>I: task
+    I->>T: ReleaseEvents() → [TaskCompleted]
+    I->>E: Emit(ctx, [TaskCompleted])
+    E->>D: Publish(TaskCompleted)
+    
+    par In-process
+        D->>L: Handle(TaskCompleted)
+    and Command Bus
+        D->>CS: Handle(TaskCompleted) → Send(CreateInvoice)
+        CS->>B: Produce(command envelope)
+        B->>CR: Consume → Handle(CreateInvoice)
+        CR->>B: Produce(reply envelope)
+        B->>I2: ReplyListener → callback
+    and Async Queue
+        D->>RL: Forward → transform → Produce
+        RL->>B: Produce("task.completed", data)
+        B->>J: Consume("task.completed")
+        J->>N: Send(taskID, message)
+    end
+    
     I->>T: RepresentTo(output)
-    I->>T: ReleaseEvents() → [TaskCreated]
-    I->>E: Emit(ctx, [TaskCreated])
-    E->>D: Publish(TaskCreated)
-    D->>L: Handle(TaskCreated)
-    D->>RL: Forward → transform → Produce
-    RL->>B: Produce("task.completed", data)
-    Note over B,J: Асинхронно (queue:work)
-    B->>J: Consume("task.completed")
-    J->>N: Send(taskID, message)
+    I-->>H: nil
+    H->>Client: JSON Response
 ```
 
-**Для `Complete()` цикл аналогичен:** `task.Complete()` → `record(TaskCompleted)` → `ReleaseEvents()` → Emitter → Dispatcher → Listener + OutboundRelay → Broker → Job.
+---
+
+## Командная шина (Command Bus)
+
+### Обзор
+
+Командная шина обеспечивает **межмодульное взаимодействие** с семантикой **запрос-ответ** (request/reply). В отличие от событий (fire-and-forget уведомления), команды:
+
+- Имеют **конкретного получателя** (один обработчик на команду)
+- Возвращают **результат** или ошибку
+- Поддерживают **идемпотентность** (повторная отправка не дублирует эффект)
+- Доставляются **асинхронно** через брокер сообщений
+
+```mermaid
+graph TB
+    subgraph "Отправитель (task module)"
+        EVT["TaskCompleted<br/><i>событие</i>"]
+        SEND["CommandSender<br/><i>сериализация + envelope</i>"]
+    end
+
+    subgraph "Транспорт"
+        BRK["Broker<br/><i>command topic</i>"]
+        REPLY["Broker<br/><i>reply topic</i>"]
+    end
+
+    subgraph "Получатель (payment module)"
+        RECV["CommandReceiver<br/><i>десериализация + dispatch</i>"]
+        HANDLER["CommandHandler<br/><i>бизнес-логика</i>"]
+    end
+
+    subgraph "Обратная связь (task module)"
+        RL["ReplyListener<br/><i>десериализация результата</i>"]
+        CB["ResultCallback<br/><i>обработка ответа</i>"]
+    end
+
+    EVT -->|"listener"| SEND
+    SEND -->|"Command Envelope"| BRK
+    BRK --> RECV
+    RECV --> HANDLER
+    HANDLER -->|"Result"| RECV
+    RECV -->|"Reply Envelope"| REPLY
+    REPLY --> RL
+    RL --> CB
+
+    style EVT fill:#fff3e0
+    style SEND fill:#e8eaf6
+    style BRK fill:#e1f5fe
+    style REPLY fill:#e1f5fe
+    style RECV fill:#e8eaf6
+    style HANDLER fill:#f3e5f5
+    style RL fill:#e8eaf6
+    style CB fill:#f3e5f5
+```
+
+Skeleton демонстрирует полный цикл на примере:
+- **Task** завершается → событие `TaskCompleted`
+- Listener отправляет команду `CreateInvoice` через Command Bus
+- **Payment** модуль получает команду, создаёт счёт, возвращает результат
+- **Task** модуль получает результат `InvoiceCreated` и логирует его
+
+### Определение команд и результатов
+
+Команды и результаты определяются в `internal/command/` — общем пространстве, доступном обоим модулям:
+
+```go
+// internal/command/invoice.go
+
+// CreateInvoice — команда создания счёта при завершении задачи.
+type CreateInvoice struct {
+    TaskID string `json:"task_id"`
+    Amount int    `json:"amount"`
+}
+
+func (c *CreateInvoice) CommandName() string    { return "CreateInvoice" }
+func (c *CreateInvoice) IdempotencyKey() string { return "invoice-" + c.TaskID }
+
+// InvoiceCreated — результат успешного создания счёта.
+type InvoiceCreated struct {
+    InvoiceID string `json:"invoice_id"`
+    TaskID    string `json:"task_id"`
+    Amount    int    `json:"amount"`
+    Status    string `json:"status"`
+}
+
+func (r *InvoiceCreated) ResultName() string { return "InvoiceCreated" }
+```
+
+**Интерфейсы, которые необходимо реализовать:**
+
+| Интерфейс | Методы | Назначение |
+|-----------|--------|-----------|
+| `commands.Command` | `CommandName()`, `IdempotencyKey()` | Идентификация команды и ключ идемпотентности |
+| `commands.Result` | `ResultName()` | Идентификация результата |
+
+> **`IdempotencyKey()`** — ключ, по которому CommandReceiver определяет повторные команды. В примере `"invoice-" + TaskID` гарантирует, что для одной задачи создаётся максимум один счёт.
+
+### CommandSender (отправка)
+
+CommandSender сериализует команду, оборачивает в envelope и отправляет в брокер. Подписка как listener на доменное событие:
+
+```go
+// presentation/listener/task_completed_command_sender.go
+
+type TaskCompletedCommandSender struct {
+    sender *commandbus.CommandSender
+    log    logger.Logger
+}
+
+func (l *TaskCompletedCommandSender) Handle(
+    ctx context.Context, e *event.TaskCompleted,
+) error {
+    cmd := &appcommand.CreateInvoice{
+        TaskID: e.TaskID,
+        Amount: 100,
+    }
+
+    if err := l.sender.Send(ctx, cmd); err != nil {
+        l.log.Error("failed to send CreateInvoice command",
+            "task_id", e.TaskID,
+            "error", err,
+        )
+        return err
+    }
+
+    l.log.Info("CreateInvoice command sent", "task_id", e.TaskID)
+    return nil
+}
+```
+
+**Регистрация в модуле:**
+
+```go
+// module.go (task)
+
+// CommandSenders регистрирует отправку команд при событиях.
+func (m *Module) CommandSenders(
+    d *events.Dispatcher, sender *commandbus.CommandSender,
+) {
+    l := listener.NewTaskCompletedCommandSender(sender, m.log)
+    events.Subscribe(d, l)
+}
+```
+
+> **Паттерн:** CommandSender — это обычный event listener. Он подписывается на доменное событие и реагирует отправкой команды. Это позволяет модулю-отправителю не знать о модуле-получателе напрямую.
+
+### CommandReceiver (обработка)
+
+CommandReceiver десериализует команду из брокера и передаёт обработчику. Обработчик реализует интерфейс `commandbus.CommandHandler`:
+
+```go
+// presentation/commandhandler/create_invoice_handler.go (payment module)
+
+// Десериализация payload → Command
+func DeserializeCreateInvoice(
+    payload []byte, _ *commandbus.CommandEnvelope,
+) (commands.Command, error) {
+    var cmd appcommand.CreateInvoice
+    if err := json.Unmarshal(payload, &cmd); err != nil {
+        return nil, err
+    }
+    return &cmd, nil
+}
+
+// Обработчик команды
+type CreateInvoiceHandler struct {
+    inter *interactor.CreateInvoiceInteractor
+}
+
+func (c CreateInvoiceHandler) Handle(
+    ctx context.Context, cmd commands.Command,
+) (commands.Result, error) {
+    createCmd, ok := cmd.(*appcommand.CreateInvoice)
+    if !ok {
+        return nil, commands.ErrHandlerNotFound
+    }
+
+    output := &createInvoiceOutput{}
+    input := &createInvoiceInput{cmd: createCmd}
+
+    if err := c.inter.Handle(ctx, input, output); err != nil {
+        return nil, err
+    }
+
+    return &appcommand.InvoiceCreated{
+        InvoiceID: output.ID,
+        TaskID:    output.TaskID,
+        Amount:    output.Amount,
+        Status:    output.Status,
+    }, nil
+}
+```
+
+**Регистрация в модуле:**
+
+```go
+// module.go (payment)
+
+// CommandHandlers регистрирует обработчики команд.
+func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver) {
+    if err := receiver.Handle(
+        "CreateInvoice",
+        commandhandler.DeserializeCreateInvoice,
+        commandhandler.NewCreateInvoiceHandler(m.createInteractor),
+    ); err != nil {
+        m.log.Error("failed to register command handler", ...)
+    }
+}
+```
+
+> **Адаптация Input/Output:** Command handler создаёт адаптеры `createInvoiceInput` и `createInvoiceOutput`, которые реализуют интерфейсы интерактора. Interactor не знает, что его вызывают из Command Bus, а не из HTTP handler'а.
+
+### ReplyListener (получение результатов)
+
+ReplyListener подписывается на topic ответов и вызывает callback при получении результата:
+
+```go
+// presentation/listener/invoice_created_reply_handler.go (task module)
+
+// Десериализация результата
+func DeserializeInvoiceCreated(
+    payload []byte, _ *commandbus.ResultEnvelope,
+) (commands.Result, error) {
+    var result appcommand.InvoiceCreated
+    if err := json.Unmarshal(payload, &result); err != nil {
+        return nil, err
+    }
+    return &result, nil
+}
+
+// Callback обработки результата
+func NewInvoiceCreatedReplyHandler(
+    log logger.Logger,
+) commandbus.ResultCallbackFunc {
+    return func(
+        _ context.Context,
+        result commands.Result,
+        err error,
+    ) error {
+        if err != nil {
+            log.Error("CreateInvoice command failed", "error", err)
+            return nil
+        }
+
+        invoiceResult, ok := result.(*appcommand.InvoiceCreated)
+        if !ok {
+            log.Error("unexpected result type for CreateInvoice")
+            return nil
+        }
+
+        log.Info("invoice created via command bus",
+            "invoice_id", invoiceResult.InvoiceID,
+            "task_id",    invoiceResult.TaskID,
+            "amount",     invoiceResult.Amount,
+            "status",     invoiceResult.Status,
+        )
+        return nil
+    }
+}
+```
+
+**Регистрация в модуле:**
+
+```go
+// module.go (task)
+
+// ReplyHandlers регистрирует обработчики ответов на команды.
+func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener) {
+    rl.OnResult(
+        "CreateInvoice",
+        listener.DeserializeInvoiceCreated,
+        listener.NewInvoiceCreatedReplyHandler(m.log),
+    )
+}
+```
+
+### Регистрация в bootstrap
+
+Все компоненты Command Bus собираются в `bootstrap/app.go`:
+
+```go
+func registerCommands(...) {
+    // 1. CommandSender: сериализация команд → брокер
+    sender := commandbus.NewCommandSender(broker, log,
+        commandbus.WithSender(serviceName),     // имя сервиса-отправителя
+        commandbus.WithReplyTo(serviceName),     // куда слать ответ
+    )
+    sender.Forward("CreateInvoice")              // регистрация маршрута команды
+    taskMod.CommandSenders(bus.Dispatcher(), sender)
+
+    // 2. CommandReceiver: брокер → десериализация → обработчик
+    receiver := commandbus.NewCommandReceiver(broker, log,
+        commandbus.WithIdempotencyTTL(24*time.Hour),  // TTL дедупликации
+    )
+    paymentMod.CommandHandlers(receiver)
+
+    // 3. ReplyListener: получение результатов
+    replyListener := commandbus.NewReplyListener(broker, log,
+        commandbus.WithListenerServiceName(serviceName),
+    )
+    taskMod.ReplyHandlers(replyListener)
+
+    // 4. Регистрация consumer'ов в queue worker
+    qw := queueworker.NewModule(log)
+
+    // Command receiver consumers (один на каждую зарегистрированную команду)
+    for _, reg := range receiver.Registrations() {
+        qw.Register(reg)
+    }
+
+    // Reply listener consumer
+    qw.Register(queueworker.Registration{
+        Name: "reply-listener",
+        Run:  replyListener.Run,
+    })
+}
+```
+
+### Полный цикл команды
+
+```mermaid
+sequenceDiagram
+    participant T as Task Module
+    participant D as Dispatcher
+    participant CS as CommandSender
+    participant B as Broker
+    participant CR as CommandReceiver
+    participant P as Payment Module
+    participant RL as ReplyListener
+    participant CB as ResultCallback
+
+    Note over T: task.Complete() → TaskCompleted
+    T->>D: Publish(TaskCompleted)
+    D->>CS: Handle(TaskCompleted)
+    CS->>CS: CreateInvoice{TaskID, Amount}
+    CS->>CS: Serialize → Command Envelope
+    CS->>B: Produce("cmd.CreateInvoice", envelope)
+    
+    Note over B: Асинхронная доставка
+    
+    B->>CR: Consume("cmd.CreateInvoice")
+    CR->>CR: Deserialize → CreateInvoice
+    CR->>CR: Check idempotency key
+    CR->>P: Handle(CreateInvoice)
+    P->>P: CreateInvoiceInteractor.Handle()
+    P-->>CR: InvoiceCreated{InvoiceID, ...}
+    CR->>CR: Serialize → Reply Envelope
+    CR->>B: Produce("reply.task-service", envelope)
+    
+    B->>RL: Consume("reply.task-service")
+    RL->>RL: Deserialize → InvoiceCreated
+    RL->>CB: callback(InvoiceCreated, nil)
+    CB->>CB: Log: "invoice created"
+```
+
+### Идемпотентность
+
+Команды поддерживают идемпотентность через `IdempotencyKey()`:
+
+```go
+func (c *CreateInvoice) IdempotencyKey() string {
+    return "invoice-" + c.TaskID
+}
+```
+
+CommandReceiver хранит обработанные ключи с TTL:
+
+```go
+receiver := commandbus.NewCommandReceiver(broker, log,
+    commandbus.WithIdempotencyTTL(24*time.Hour),  // ключ хранится 24 часа
+)
+```
+
+При повторном получении команды с тем же `IdempotencyKey`:
+- Команда **не обрабатывается повторно**
+- Возвращается **закешированный результат** (если есть)
+
+Дополнительно, интерактор payment-модуля проверяет наличие существующего счёта:
+
+```go
+func (i *CreateInvoiceInteractor) Handle(ctx, input, output) error {
+    // Проверяем, не создан ли уже счёт для этой задачи
+    existing, _ := i.repo.FindByTaskID(ctx, input.GetTaskID())
+    if existing != nil {
+        existing.RepresentTo(output)
+        return nil  // возвращаем существующий, не создаём дубликат
+    }
+    // ... создание нового счёта
+}
+```
+
+> **Два уровня защиты:** идемпотентность на уровне транспорта (CommandReceiver) + бизнес-идемпотентность на уровне домена (проверка в интеракторе).
+
+### Когда использовать Command Bus vs Events
+
+| Характеристика | Events | Command Bus |
+|---------------|--------|-------------|
+| **Семантика** | «Что-то произошло» (уведомление) | «Сделай это» (запрос) |
+| **Получатели** | 0..N подписчиков | Ровно 1 обработчик |
+| **Ответ** | Нет (fire-and-forget) | Есть (Result или ошибка) |
+| **Связанность** | Слабая (отправитель не знает о подписчиках) | Средняя (отправитель знает имя команды) |
+| **Идемпотентность** | На стороне подписчика | Встроенная (IdempotencyKey + TTL) |
+| **Примеры** | Логирование, метрики, уведомления | Создание связанных сущностей, платежи |
+
+**В skeleton оба механизма работают вместе:**
+
+```mermaid
+graph LR
+    TC["TaskCompleted<br/><i>событие</i>"]
+    
+    TC --> L1["Listener<br/><i>логирование</i>"]
+    TC --> CS["CommandSender<br/><i>CreateInvoice</i>"]
+    TC --> RL["OutboundRelay<br/><i>уведомление</i>"]
+    
+    style TC fill:#fff3e0
+    style L1 fill:#f3e5f5
+    style CS fill:#e8eaf6
+    style RL fill:#e1f5fe
+```
+
+Одно событие `TaskCompleted` порождает:
+1. **Listener** — синхронное логирование (in-process)
+2. **CommandSender** — создание счёта в payment-модуле (Command Bus)
+3. **OutboundRelay** — пересылка в очередь для async notification job
 
 ---
 
@@ -1071,7 +1620,7 @@ make run-worker
 go run ./cmd/app queue:work
 ```
 
-> **`serve` vs `queue:work`**: команда `serve` запускает HTTP-сервер **и** воркеры очередей. Команда `queue:work` запускает **только** воркеры (без HTTP). Используйте `queue:work` для выделенных worker-нод.
+> **`serve` vs `queue:work`**: команда `serve` запускает HTTP-сервер **и** воркеры очередей (включая Command Bus consumers). Команда `queue:work` запускает **только** воркеры (без HTTP). Используйте `queue:work` для выделенных worker-нод.
 
 ---
 
@@ -1082,6 +1631,7 @@ go run ./cmd/app queue:work
 Маршруты регистрируются в `module.go` через `httpserver.Router`:
 
 ```go
+// task module
 func (m *Module) Routes(router *httpserver.Router) {
     group := router.Group("/api/v1/tasks")
 
@@ -1089,6 +1639,13 @@ func (m *Module) Routes(router *httpserver.Router) {
     group.GET("", api.NewListTasksHandler(m.listInteractor))
     group.GET("/{id}", api.NewGetTaskHandler(m.getInteractor))
     group.POST("/{id}/complete", api.NewCompleteTaskHandler(m.completeInteractor))
+}
+
+// payment module
+func (m *Module) Routes(router *httpserver.Router) {
+    group := router.Group("/api/v1/invoices")
+
+    group.GET("", api.NewListInvoicesHandler(m.listInteractor))
 }
 ```
 
@@ -1141,7 +1698,7 @@ var ErrTitleRequired = taskCode("TITLE_REQUIRED").
 // {"code": "TASK_TITLE_REQUIRED", "message": "task title is required"}
 ```
 
-> **Префиксы ошибок**: доменные ошибки используют префикс `TASK` (`taskCode`), API-специфичные — `TASK_API` (`apiCode`). Это позволяет различать источник ошибки в логах и ответах.
+> **Префиксы ошибок**: доменные ошибки используют префикс `TASK` (`taskCode`), API-специфичные — `TASK_API` (`apiCode`), payment — `INVOICE` (`invoiceCode`). Это позволяет различать источник ошибки в логах и ответах.
 
 ---
 
@@ -1154,13 +1711,13 @@ graph TB
     AGG["Task aggregate<br/><i>приватные поля</i>"] -->|RepresentTo| PI["TaskPresenter<br/><i>интерфейс</i>"]
 
     PI --> HTTP["CreateTaskOutput<br/><i>JSON struct</i>"]
-    PI --> EVT["taskEvent<br/><i>данные для event</i>"]
+    PI --> CMD["createInvoiceOutput<br/><i>Command Bus result</i>"]
     PI --> TEST["mockPresenter<br/><i>для тестов</i>"]
 
     style AGG fill:#fff3e0
     style PI fill:#e1f5fe
     style HTTP fill:#f3e5f5
-    style EVT fill:#e8f5e9
+    style CMD fill:#e8eaf6
     style TEST fill:#fce4ec
 ```
 
@@ -1195,6 +1752,14 @@ type CreateTaskOutput struct {
     // ...
 }
 func (o *CreateTaskOutput) SetID(v string) model.TaskPresenter { o.ID = v; return o }
+
+// presentation/commandhandler/ — для результата команды
+type createInvoiceOutput struct {
+    ID     string `json:"invoice_id"`
+    TaskID string `json:"task_id"`
+    // ...
+}
+func (o *createInvoiceOutput) SetID(v string) model.InvoicePresenter { o.ID = v; return o }
 ```
 
 ---
@@ -1318,12 +1883,14 @@ cp deployments/.env.example deployments/.env
 test/http/
 ├── .env.http                      # Переменные окружения
 ├── http-client.env.json           # Окружения JetBrains
-└── task/
-    ├── create.http                # Создание задач (+ ошибки)
-    ├── list.http                  # Список задач
-    ├── get.http                   # Получение по ID (+ ошибки)
-    ├── complete.http              # Завершение (+ ошибки)
-    └── scenario.http              # Полный E2E сценарий с assertions
+├── task/
+│   ├── create.http                # Создание задач (+ ошибки)
+│   ├── list.http                  # Список задач
+│   ├── get.http                   # Получение по ID (+ ошибки)
+│   ├── complete.http              # Завершение (+ ошибки)
+│   └── scenario.http              # Полный E2E сценарий с assertions
+└── invoice/
+    └── list.http                  # Список счетов
 ```
 
 Файл `scenario.http` содержит полный end-to-end сценарий с проверками:
@@ -1337,10 +1904,15 @@ Content-Type: application/json
 > {% client.assert(response.status === 201); %}
 > {% client.global.set("TASK_ID", response.body.id); %}
 
-### Завершить задачу
+### Завершить задачу (→ автоматически создаст invoice через Command Bus)
 POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
 
 > {% client.assert(response.body.status === "done"); %}
+
+### Проверить, что invoice создан
+GET {{BASE_URL}}/api/v1/invoices
+
+> {% client.assert(response.body.invoices.length > 0); %}
 ```
 
 ---
@@ -1443,6 +2015,8 @@ func (o *Order) ReleaseEvents() []event.Event {
 
 ### 3. Реализуйте фасад модуля
 
+Для модулей с событиями и командами:
+
 ```go
 // internal/module/order/module.go
 package order
@@ -1452,14 +2026,25 @@ type Module struct { ... }
 func NewModule(
     db *sql.DB,
     dispatcher *events.Dispatcher,
-    log logger.Logger,             // internal/logger.Logger (structural typing)
+    log logger.Logger,
 ) *Module { ... }
 
 func (m *Module) Routes(router *httpserver.Router)           { ... }
 func (m *Module) Listeners(d *events.Dispatcher)             { ... }
+func (m *Module) CommandSenders(d *events.Dispatcher, sender *commandbus.CommandSender)  { ... }
+func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener) { ... }
 func (m *Module) Relays(relay *eventbus.OutboundRelay)       { ... }
 func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker) { ... }
 func (m *Module) Migrations(runner *migration.Runner)        { ... }
+```
+
+Для модулей-получателей команд:
+
+```go
+func NewModule(db *sql.DB, log logger.Logger) *Module { ... }
+func (m *Module) Routes(router *httpserver.Router)                      { ... }
+func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver)   { ... }
+func (m *Module) Migrations(runner *migration.Runner)                   { ... }
 ```
 
 ### 4. Зарегистрируйте модуль в bootstrap
@@ -1470,6 +2055,8 @@ orderMod := order.NewModule(dbm.Default(), bus.Dispatcher(), log)
 
 // В registerCommands — передайте модуль
 orderMod.Listeners(bus.Dispatcher())
+orderMod.CommandSenders(bus.Dispatcher(), sender)
+orderMod.ReplyHandlers(replyListener)
 orderMod.Relays(relay)
 orderMod.Consumers(qw, broker)
 orderMod.Migrations(runner)
@@ -1480,16 +2067,38 @@ orderMod.Migrations(runner)
 func buildRouter(
     log *logger.Logger,
     taskMod *task.Module,
+    paymentMod *payment.Module,
     orderMod *order.Module,
 ) *httpserver.Router {
     router := httpserver.NewRouter()
     router.Use(...)
 
     taskMod.Routes(router)
+    paymentMod.Routes(router)
     orderMod.Routes(router)
 
     return router
 }
+```
+
+### 5. Определите команды (если нужно межмодульное взаимодействие)
+
+```go
+// internal/command/shipment.go
+type CreateShipment struct {
+    OrderID string `json:"order_id"`
+    Address string `json:"address"`
+}
+
+func (c *CreateShipment) CommandName() string    { return "CreateShipment" }
+func (c *CreateShipment) IdempotencyKey() string { return "shipment-" + c.OrderID }
+
+type ShipmentCreated struct {
+    ShipmentID string `json:"shipment_id"`
+    OrderID    string `json:"order_id"`
+}
+
+func (r *ShipmentCreated) ResultName() string { return "ShipmentCreated" }
 ```
 
 ---
