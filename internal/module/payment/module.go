@@ -45,7 +45,7 @@ func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver) {
 	if err := receiver.Handle(
 		"CreateInvoice",
 		commandhandler.DeserializeCreateInvoice,
-		commandhandler.HandleCreateInvoice(m.createInteractor),
+		commandhandler.NewCreateInvoiceHandler(m.createInteractor),
 	); err != nil {
 		m.log.Error("failed to register command handler",
 			"command", "CreateInvoice",

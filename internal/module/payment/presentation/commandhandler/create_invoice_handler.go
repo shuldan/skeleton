@@ -67,30 +67,33 @@ func DeserializeCreateInvoice(
 	return &cmd, nil
 }
 
-// HandleCreateInvoice обрабатывает команду и возвращает результат.
-func HandleCreateInvoice(
-	inter *interactor.CreateInvoiceInteractor,
-) commandbus.CommandHandlerFunc {
-	return func(
-		ctx context.Context, cmd commands.Command,
-	) (commands.Result, error) {
-		createCmd, ok := cmd.(*appcommand.CreateInvoice)
-		if !ok {
-			return nil, commands.ErrHandlerNotFound
-		}
+type CreateInvoiceHandler struct {
+	inter *interactor.CreateInvoiceInteractor
+}
 
-		output := &createInvoiceOutput{}
-		input := &createInvoiceInput{cmd: createCmd}
-
-		if err := inter.Handle(ctx, input, output); err != nil {
-			return nil, err
-		}
-
-		return &appcommand.InvoiceCreated{
-			InvoiceID: output.ID,
-			TaskID:    output.TaskID,
-			Amount:    output.Amount,
-			Status:    output.Status,
-		}, nil
+func NewCreateInvoiceHandler(inter *interactor.CreateInvoiceInteractor) commandbus.CommandHandler {
+	return &CreateInvoiceHandler{
+		inter: inter,
 	}
+}
+
+func (c CreateInvoiceHandler) Handle(ctx context.Context, cmd commands.Command) (commands.Result, error) {
+	createCmd, ok := cmd.(*appcommand.CreateInvoice)
+	if !ok {
+		return nil, commands.ErrHandlerNotFound
+	}
+
+	output := &createInvoiceOutput{}
+	input := &createInvoiceInput{cmd: createCmd}
+
+	if err := c.inter.Handle(ctx, input, output); err != nil {
+		return nil, err
+	}
+
+	return &appcommand.InvoiceCreated{
+		InvoiceID: output.ID,
+		TaskID:    output.TaskID,
+		Amount:    output.Amount,
+		Status:    output.Status,
+	}, nil
 }
