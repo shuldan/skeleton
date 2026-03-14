@@ -21,18 +21,18 @@ type CreateTaskOutput interface {
 
 // CreateTaskInteractor оркестрирует создание задачи.
 type CreateTaskInteractor struct {
-	creatingOp     operation.CreatingOperation
-	createdEmitter emitter.EventEmitter
+	creatingOp operation.CreatingOperation
+	emitter    emitter.EventEmitter
 }
 
 // NewCreateTaskInteractor создаёт интерактор.
 func NewCreateTaskInteractor(
 	creatingOp operation.CreatingOperation,
-	createdEmitter emitter.EventEmitter,
+	emitter emitter.EventEmitter,
 ) *CreateTaskInteractor {
 	return &CreateTaskInteractor{
-		creatingOp:     creatingOp,
-		createdEmitter: createdEmitter,
+		creatingOp: creatingOp,
+		emitter:    emitter,
 	}
 }
 
@@ -54,8 +54,8 @@ func (i *CreateTaskInteractor) Handle(
 		return err
 	}
 
+	i.emitter.Emit(ctx, task.ReleaseEvents())
 	task.RepresentTo(output)
-	i.createdEmitter.Emit(ctx, task)
 
 	return nil
 }

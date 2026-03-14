@@ -37,7 +37,7 @@ func (i *GetTaskInteractor) Handle(
 	input GetTaskInput,
 	output GetTaskOutput,
 ) error {
-	taskID := model.TaskID(uuid.MustParse(input.GetTaskID()))
+	taskID := model.NewTaskID(uuid.MustParse(input.GetTaskID()).String())
 
 	task, err := i.repo.FindByID(ctx, taskID)
 	if err != nil {

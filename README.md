@@ -1,6 +1,6 @@
 # Skeleton — Go Application Template
 
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **Skeleton** — `gonew`-совместимый шаблон Go-приложения с модульной DDD-архитектурой, встроенной системой событий, очередями, миграциями и Docker-окружением. Содержит один модуль (`task`) в качестве примера — удалите или замените его на свой домен.
@@ -33,9 +33,11 @@
   - [Репозитории](#репозитории)
 - [События](#события)
   - [Определение событий](#определение-событий)
+  - [Накопление событий в агрегате](#накопление-событий-в-агрегате)
   - [Emitter (публикация)](#emitter-публикация)
   - [Listener (подписка)](#listener-подписка)
-  - [Relay (пересылка в очередь)](#relay-пересылка-в-очередь)
+  - [OutboundRelay (пересылка в очередь)](#outboundrelay-пересылка-в-очередь)
+  - [Полный цикл события в task-модуле](#полный-цикл-события-в-task-модуле)
 - [Очереди](#очереди)
 - [HTTP-сервер](#http-сервер)
   - [Маршрутизация](#маршрутизация)
@@ -146,6 +148,7 @@ sequenceDiagram
     participant I as Interactor
     participant O as Operation
     participant Repo as Repository
+    participant Agg as Aggregate
     participant E as Emitter
     participant D as Dispatcher
 
@@ -156,12 +159,14 @@ sequenceDiagram
     H->>I: interactor.Handle(ctx, input, output)
     I->>I: Validate (NewTitle, etc.)
     I->>O: operation.Create(ctx, ...)
+    O->>Agg: NewTask() → record(TaskCreated)
     O->>Repo: repo.Save(ctx, task)
     Repo-->>O: nil / error
     O-->>I: *Task, error
     I->>I: task.RepresentTo(output)
-    I->>E: emitter.Emit(ctx, task)
-    E->>D: dispatcher.Publish(ctx, event)
+    I->>I: task.ReleaseEvents()
+    I->>E: emitter.Emit(ctx, []event.Event)
+    E->>D: dispatcher.Publish(ctx, event) × N
     I-->>H: nil / error
     H->>C: JSON Response
 ```
@@ -170,14 +175,16 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    INT["Interactor"] --> EM["Emitter"]
+    AGG["Aggregate<br/><i>record(event)</i>"] --> INT["Interactor<br/><i>ReleaseEvents()</i>"]
+    INT --> EM["Emitter<br/><i>[]event.Event</i>"]
     EM --> DISP["Dispatcher"]
     
     DISP --> L1["Listener<br/><i>in-process</i>"]
-    DISP --> RELAY["Relay"]
-    RELAY --> BROKER["Broker<br/><i>memory / rabbitmq / ...</i>"]
+    DISP --> RELAY["OutboundRelay"]
+    RELAY --> BROKER["Broker<br/><i>memory / redis / ...</i>"]
     BROKER --> JOB["Job / Consumer<br/><i>async worker</i>"]
 
+    style AGG fill:#fff3e0
     style INT fill:#e8f5e9
     style DISP fill:#fff3e0
     style L1 fill:#f3e5f5
@@ -185,17 +192,26 @@ graph LR
     style JOB fill:#fce4ec
 ```
 
+**Поток событий:**
+
+1. Агрегат **накапливает** события через `record()` при изменении состояния
+2. Interactor вызывает `task.ReleaseEvents()` — забирает и очищает очередь
+3. Emitter итерирует по слайсу и публикует каждое событие в Dispatcher
+4. Dispatcher доставляет события в Listener (in-process) и OutboundRelay (→ очередь)
+5. Job/Consumer читает из очереди и обрабатывает асинхронно
+
 ### Принципы
 
 | Принцип | Реализация |
 |---------|-----------|
-| **DDD** | Агрегаты, value objects, domain events, репозитории |
+| **DDD** | Агрегаты, value objects, domain events (накопление в агрегате), репозитории |
 | **Clean Architecture** | Зависимости направлены внутрь: presentation → application → domain ← infrastructure |
 | **Модульность** | Каждый домен — изолированный модуль с фасадом `module.go` |
 | **Presenter-паттерн** | Домен не знает о JSON/HTTP; данные передаются через `TaskPresenter` |
 | **Snapshot-паттерн** | Персистентность через плоские снимки агрегата, без экспорта приватных полей |
 | **CQRS-lite** | Разделение операций записи (operations/interactors) и чтения |
-| **Event-Driven** | In-process события + relay в очередь для async-обработки |
+| **Event-Driven** | Агрегат накапливает события → emitter публикует пакетом → relay пересылает в очередь |
+| **Structural typing** | Модули определяют свой `Logger` интерфейс, совместимый с `framework/logger` без импорта |
 
 ---
 
@@ -218,7 +234,11 @@ skeleton/
 │   │   └── router.go                # Сборка HTTP-маршрутизатора
 │   │
 │   ├── event/
+│   │   ├── event.go                 # Интерфейс Event (доменная граница)
 │   │   └── task.go                  # Глобальные определения событий
+│   │
+│   ├── logger/
+│   │   └── logger.go                # Интерфейс Logger (structural typing)
 │   │
 │   └── module/
 │       └── task/                    # ── Пример модуля ──
@@ -234,7 +254,7 @@ skeleton/
 │   ├── docker-compose.dev.yml       # Development overlay
 │   └── docker/
 │       ├── Dockerfile               # Multi-stage production
-│       ├── golang/Dockerfile         # Dev-контейнер
+│       ├── golang/Dockerfile        # Dev-контейнер
 │       └── postgres/                # PostgreSQL + init-скрипты
 │
 ├── test/
@@ -317,7 +337,7 @@ graph TB
 ```
 domain/
 ├── model/
-│   ├── task.go              # Агрегат (приватные поля, поведение)
+│   ├── task.go              # Агрегат (приватные поля, поведение, накопление событий)
 │   ├── task_id.go           # Value object TaskID
 │   ├── title.go             # Value object Title (с валидацией)
 │   ├── status.go            # Value object Status (state machine)
@@ -334,27 +354,56 @@ domain/
         └── event_emitter.go         # Интерфейс EventEmitter
 ```
 
-**Агрегат** инкапсулирует состояние и бизнес-правила:
+**Агрегат** инкапсулирует состояние, бизнес-правила и накапливает доменные события:
 
 ```go
 type Task struct {
     id          TaskID
     title       Title
     description string
-    status      Status
+    status      status
     version     int
+    events      []event.Event   // очередь доменных событий
 }
 
-// Поведение — единственный способ изменить состояние
+// Конструктор — создаёт задачу и записывает событие TaskCreated
+func NewTask(id TaskID, title Title, description string) *Task {
+    task := &Task{
+        id: id, title: title, description: description,
+        status: statusDraft, version: 1,
+    }
+    task.record(&event.TaskCreated{
+        BaseEvent: events.NewBaseEvent("TaskCreated", task.id.String()),
+        TaskID:    task.id.String(),
+        Title:     title.String(),
+    })
+    return task
+}
+
+// Поведение — изменение состояния + запись события
 func (t *Task) Complete() error {
-    newStatus, err := t.status.TransitionTo(StatusDone)
+    newStatus, err := t.status.transitionTo(statusDone)
     if err != nil {
         return err
     }
     t.status = newStatus
+    t.record(&event.TaskCompleted{...})
     return nil
 }
+
+// ReleaseEvents — забирает накопленные события и очищает очередь
+func (t *Task) ReleaseEvents() []event.Event {
+    evts := t.events
+    t.events = nil
+    return evts
+}
+
+func (t *Task) record(e event.Event) {
+    t.events = append(t.events, e)
+}
 ```
+
+> **Паттерн:** события не публикуются немедленно. Агрегат накапливает их через `record()`, а interactor забирает пакетом через `ReleaseEvents()` после успешного сохранения. Это гарантирует, что события публикуются только при успешной операции.
 
 **Value objects** содержат валидацию при создании:
 
@@ -379,11 +428,13 @@ stateDiagram-v2
 ```
 
 ```go
-var transitions = map[Status][]Status{
-    StatusDraft:      {StatusInProgress, StatusDone},
-    StatusInProgress: {StatusDone},
+var transitions = map[string][]status{
+    "draft":       {statusInProgress, statusDone},
+    "in_progress": {statusDone},
 }
 ```
+
+> **Инкапсуляция:** тип `status` и его методы неэкспортируемые. Вне пакета `model` нельзя создать произвольный статус или вызвать переход напрямую — только через методы агрегата.
 
 ### Application
 
@@ -401,9 +452,7 @@ application/
 │   │   ├── creating_operation.go     # Реализация CreatingOperation
 │   │   └── completing_operation.go   # Реализация CompletingOperation
 │   └── emitter/
-│       ├── task_created_emitter.go   # Публикация TaskCreated
-│       ├── task_completed_emitter.go # Публикация TaskCompleted
-│       └── task_event.go            # Приватный presenter для извлечения данных
+│       └── task_emitter.go           # Единый emitter для всех событий Task
 └── port/
     └── notification_port.go          # Порт для внешних уведомлений
 ```
@@ -426,11 +475,13 @@ func (i *CreateTaskInteractor) Handle(
         return err
     }
 
-    task.RepresentTo(output)          // заполнение output через presenter
-    i.createdEmitter.Emit(ctx, task)  // публикация события
+    task.RepresentTo(output)              // заполнение output через presenter
+    i.emitter.Emit(ctx, task.ReleaseEvents())  // публикация пакета событий
     return nil
 }
 ```
+
+> **Порядок:** сначала `RepresentTo` (данные для ответа), затем `ReleaseEvents` + `Emit` (публикация событий). События публикуются только после успешного сохранения в Operation.
 
 **Operation** — изолированная бизнес-операция (запись в репозиторий):
 
@@ -438,13 +489,38 @@ func (i *CreateTaskInteractor) Handle(
 func (o *CreatingOperation) Create(
     ctx context.Context, title model.Title, description string,
 ) (*model.Task, error) {
-    task := model.NewTask(title, description)
+    id := model.NewTaskID(uuid.New().String())
+    task := model.NewTask(id, title, description)  // → record(TaskCreated)
+
     if err := o.repo.Save(ctx, task); err != nil {
         return nil, err
     }
     return task, nil
 }
 ```
+
+**Emitter** — единый для всех событий агрегата. Принимает слайс событий и публикует каждое в Dispatcher:
+
+```go
+func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
+    publishCtx := context.WithoutCancel(ctx)  // события отправляются даже при отмене запроса
+
+    for _, ev := range domainEvents {
+        dispatchable, ok := ev.(events.Event)
+        if !ok {
+            e.log.Error("event does not implement events.Event", ...)
+            continue
+        }
+        if err := e.dispatcher.Publish(publishCtx, dispatchable); err != nil {
+            e.log.Error("failed to emit event", ...)
+        }
+    }
+}
+```
+
+> **`context.WithoutCancel`**: emitter публикует события в контексте, не привязанном к HTTP-запросу. Если клиент отключился, события всё равно доставляются подписчикам.
+
+> **Граница доменного и инфраструктурного события:** домен работает с интерфейсом `event.Event` (определён в `internal/event`), а emitter кастит к `events.Event` из библиотеки для публикации через Dispatcher. Домен не зависит от инфраструктурной библиотеки событий.
 
 **Port** — интерфейс к внешней системе, реализуемый в infrastructure:
 
@@ -478,7 +554,7 @@ func scanTask(sc repository.Scanner) (*model.Task, error) {
     ); err != nil {
         return nil, err
     }
-    return s.Restore()  // восстановление агрегата из снимка
+    return s.Restore()  // восстановление агрегата из снимка (без записи событий)
 }
 
 func taskValues(t *model.Task) []any {
@@ -486,6 +562,22 @@ func taskValues(t *model.Task) []any {
     return []any{s.ID, s.Title, s.Description, s.Status, s.Version}
 }
 ```
+
+> **Snapshot vs конструктор:** `NewTask()` записывает `TaskCreated` событие, а `Restore()` — нет. При чтении из БД события не генерируются.
+
+**Маппинг ошибок репозитория:**
+
+```go
+func (r *taskRepository) FindByID(ctx context.Context, id model.TaskID) (*model.Task, error) {
+    task, err := r.repo.Find(ctx, id.String())
+    if errors.Is(err, repository.ErrNotFound) {
+        return nil, model.ErrTaskNotFound.WithDetail("id", id.String())
+    }
+    return task, err
+}
+```
+
+Инфраструктурные ошибки (`repository.ErrNotFound`, `repository.ErrConcurrentModification`) транслируются в доменные (`model.ErrTaskNotFound`, `model.ErrConcurrentModification`).
 
 ### Presentation
 
@@ -526,21 +618,25 @@ func (h *createTaskHandler) handle(w http.ResponseWriter, r *http.Request) error
 }
 ```
 
+**UUID-валидация** происходит в interactor'ах через `uuid.MustParse()`. При невалидном ID — паника, которую перехватывает middleware `Recovery` и возвращает клиенту `500 Internal Error`. Для кастомной ошибки валидации можно добавить проверку в handler.
+
 ### module.go — фасад
 
 Единственная точка контакта модуля с внешним миром. Собирает граф зависимостей и предоставляет методы регистрации:
 
 ```go
 // NewModule собирает внутренний граф зависимостей
-func NewModule(db *sql.DB, dispatcher *events.Dispatcher, log *logger.Logger) *Module
+func NewModule(db *sql.DB, dispatcher *events.Dispatcher, log logger.Logger) *Module
 
 // Регистрация компонентов — вызываются из bootstrap
 func (m *Module) Routes(router *httpserver.Router)
 func (m *Module) Listeners(d *events.Dispatcher)
-func (m *Module) Relays(relay *eventbus.Relay)
+func (m *Module) Relays(relay *eventbus.OutboundRelay)
 func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker)
 func (m *Module) Migrations(runner *migration.Runner)
 ```
+
+> **`logger.Logger`**: модуль принимает интерфейс `logger.Logger` из `internal/logger`, а не конкретный тип из фреймворка. Благодаря structural typing, `framework/logger.Logger` удовлетворяет этому интерфейсу автоматически.
 
 ---
 
@@ -616,8 +712,8 @@ go run ./cmd/app config:dump
 
 | Команда | Описание |
 |---------|---------|
-| `serve` | Запуск HTTP-сервера |
-| `queue:work` | Запуск воркера очередей |
+| `serve` | Запуск HTTP-сервера + фоновые воркеры |
+| `queue:work` | Запуск только воркеров очередей (без HTTP) |
 | `migrate:up` | Применить все pending-миграции |
 | `migrate:down` | Откатить последнюю миграцию |
 | `migrate:status` | Показать статус миграций |
@@ -725,19 +821,24 @@ repo := repository.New(
 
 ```mermaid
 graph LR
-    subgraph Синхронно
-        INT["Interactor"] --> EM["Emitter"]
+    subgraph "Внутри агрегата"
+        AGG["Aggregate<br/>record()"] --> REL["ReleaseEvents()"]
+    end
+
+    subgraph "Синхронно (in-process)"
+        REL --> EM["Emitter<br/>[]event.Event"]
         EM --> DISP["Dispatcher"]
         DISP --> LST["Listener"]
     end
 
-    subgraph Асинхронно
-        DISP --> RLY["Relay"]
+    subgraph "Асинхронно (через очередь)"
+        DISP --> RLY["OutboundRelay"]
         RLY --> BRK["Broker"]
         BRK --> JOB["Job"]
     end
 
-    style INT fill:#e8f5e9
+    style AGG fill:#fff3e0
+    style EM fill:#e8f5e9
     style DISP fill:#fff3e0
     style LST fill:#f3e5f5
     style BRK fill:#e1f5fe
@@ -749,6 +850,16 @@ graph LR
 Глобальные структуры событий объявляются в `internal/event/`:
 
 ```go
+// internal/event/event.go — доменная граница событий
+type Event interface {
+    EventName() string
+    OccurredAt() time.Time
+    AggregateID() string
+}
+```
+
+```go
+// internal/event/task.go — конкретные события
 type TaskCreated struct {
     events.BaseEvent
     TaskID string `json:"task_id"`
@@ -761,26 +872,83 @@ type TaskCompleted struct {
 }
 ```
 
-### Emitter (публикация)
+> **Граница:** домен зависит от `internal/event.Event` (свой интерфейс), а не от `shuldan/events.Event` (библиотека). Emitter в application-слое кастит к библиотечному типу при публикации. Так домен остаётся независимым от инфраструктуры.
 
-Emitter определяется как доменный интерфейс и реализуется в application:
+### Накопление событий в агрегате
+
+Агрегат **не публикует** события немедленно. Он записывает их во внутреннюю очередь:
 
 ```go
-// domain/business/emitter/
-type EventEmitter interface {
-    Emit(ctx context.Context, task *model.Task)
+// Конструктор — записывает TaskCreated
+func NewTask(id TaskID, title Title, description string) *Task {
+    task := &Task{...}
+    task.record(&event.TaskCreated{
+        BaseEvent: events.NewBaseEvent("TaskCreated", task.id.String()),
+        TaskID:    task.id.String(),
+        Title:     title.String(),
+    })
+    return task
 }
 
-// application/business/emitter/
-func (e *TaskCreatedEmitter) Emit(ctx context.Context, task *model.Task) {
-    ev := &taskEvent{}
-    task.RepresentTo(ev)  // извлечение данных через presenter
-
-    e.dispatcher.Publish(ctx, event.TaskCreated{
-        BaseEvent: events.NewBaseEvent("TaskCreated", ev.taskID),
-        TaskID:    ev.taskID,
-        Title:     ev.title,
+// Метод поведения — записывает TaskCompleted
+func (t *Task) Complete() error {
+    newStatus, err := t.status.transitionTo(statusDone)
+    if err != nil {
+        return err
+    }
+    t.status = newStatus
+    t.record(&event.TaskCompleted{
+        BaseEvent: events.NewBaseEvent("TaskCompleted", t.id.String()),
+        TaskID:    t.id.String(),
     })
+    return nil
+}
+
+// ReleaseEvents — interactor забирает события после успешного сохранения
+func (t *Task) ReleaseEvents() []event.Event {
+    evts := t.events
+    t.events = nil
+    return evts
+}
+```
+
+> **Гарантия:** если `repo.Save()` вернул ошибку, interactor не вызывает `ReleaseEvents()` — события не публикуются. Если `Restore()` восстанавливает агрегат из БД — события не записываются.
+
+### Emitter (публикация)
+
+Единый emitter принимает **слайс событий** и публикует каждое в Dispatcher:
+
+```go
+func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
+    publishCtx := context.WithoutCancel(ctx)
+
+    for _, ev := range domainEvents {
+        dispatchable, ok := ev.(events.Event)
+        if !ok {
+            e.log.Error("event does not implement events.Event", ...)
+            continue
+        }
+        if err := e.dispatcher.Publish(publishCtx, dispatchable); err != nil {
+            e.log.Error("failed to emit event", ...)
+        }
+    }
+}
+```
+
+**Ключевые решения:**
+
+| Решение | Причина |
+|---------|---------|
+| `context.WithoutCancel(ctx)` | Клиент отключился — события всё равно доставляются |
+| Один emitter на агрегат | Проще, чем per-event emitter. Новое событие = 0 новых файлов в emitter |
+| Каст `event.Event` → `events.Event` | Домен не зависит от библиотеки; адаптация на границе |
+
+**Доменный интерфейс:**
+
+```go
+// domain/business/emitter/event_emitter.go
+type EventEmitter interface {
+    Emit(ctx context.Context, events []event.Event)
 }
 ```
 
@@ -789,28 +957,32 @@ func (e *TaskCreatedEmitter) Emit(ctx context.Context, task *model.Task) {
 In-process подписка через типизированный `Subscribe`:
 
 ```go
-// presentation/listener/
-type TaskCompletedListener struct { ... }
+// presentation/listener/task_completed_listener.go
+type TaskCompletedListener struct {
+    log logger.Logger
+}
 
 func (l *TaskCompletedListener) Handle(
-    _ context.Context, e event.TaskCompleted,
+    _ context.Context, e *event.TaskCompleted,
 ) error {
-    l.log("task completed", "task_id", e.TaskID)
+    l.log.Info("task completed event received", "task_id", e.TaskID)
     return nil
 }
 
-// module.go
+// module.go — регистрация struct-based listener
 func (m *Module) Listeners(d *events.Dispatcher) {
-    events.Subscribe(d, listener.NewTaskCompletedListener(m.logInfo))
+    events.Subscribe(d, listener.NewTaskCompletedListener(m.log))
 }
 ```
 
-### Relay (пересылка в очередь)
+> **`events.Subscribe` vs `events.SubscribeFunc`**: skeleton использует struct-based `Subscribe` — listener реализует `Handle(ctx, *EventType) error`. Для простых случаев можно использовать `SubscribeFunc` с замыканием.
 
-Для асинхронной обработки события пересылаются в message broker:
+### OutboundRelay (пересылка в очередь)
+
+Для асинхронной обработки события пересылаются из Dispatcher в message broker через `OutboundRelay`:
 
 ```go
-func (m *Module) Relays(relay *eventbus.Relay) {
+func (m *Module) Relays(relay *eventbus.OutboundRelay) {
     relay.Forward("TaskCompleted", "task.completed",
         eventbus.WithTransform(func(e events.Event) ([]byte, error) {
             return json.Marshal(map[string]string{
@@ -821,6 +993,45 @@ func (m *Module) Relays(relay *eventbus.Relay) {
     )
 }
 ```
+
+> **`WithTransform` vs Envelope:** по умолчанию `OutboundRelay` оборачивает события в стандартный `Envelope` (см. документацию фреймворка). `WithTransform` обходит Envelope и позволяет задать кастомную сериализацию. Используйте `WithTransform` для простых случаев или интеграции со сторонними системами; Envelope — для межсервисной коммуникации с трассировкой.
+
+### Полный цикл события в task-модуле
+
+```mermaid
+sequenceDiagram
+    participant H as Handler
+    participant I as Interactor
+    participant O as Operation
+    participant T as Task (aggregate)
+    participant R as Repository
+    participant E as Emitter
+    participant D as Dispatcher
+    participant L as Listener (in-process)
+    participant RL as OutboundRelay
+    participant B as Broker
+    participant J as Job (async)
+    participant N as NotificationPort
+
+    H->>I: Handle(ctx, input, output)
+    I->>O: Create(ctx, title, desc)
+    O->>T: NewTask() → record(TaskCreated)
+    O->>R: Save(task)
+    R-->>O: ok
+    O-->>I: task
+    I->>T: RepresentTo(output)
+    I->>T: ReleaseEvents() → [TaskCreated]
+    I->>E: Emit(ctx, [TaskCreated])
+    E->>D: Publish(TaskCreated)
+    D->>L: Handle(TaskCreated)
+    D->>RL: Forward → transform → Produce
+    RL->>B: Produce("task.completed", data)
+    Note over B,J: Асинхронно (queue:work)
+    B->>J: Consume("task.completed")
+    J->>N: Send(taskID, message)
+```
+
+**Для `Complete()` цикл аналогичен:** `task.Complete()` → `record(TaskCompleted)` → `ReleaseEvents()` → Emitter → Dispatcher → Listener + OutboundRelay → Broker → Job.
 
 ---
 
@@ -860,6 +1071,8 @@ make run-worker
 go run ./cmd/app queue:work
 ```
 
+> **`serve` vs `queue:work`**: команда `serve` запускает HTTP-сервер **и** воркеры очередей. Команда `queue:work` запускает **только** воркеры (без HTTP). Используйте `queue:work` для выделенных worker-нод.
+
 ---
 
 ## HTTP-сервер
@@ -885,11 +1098,13 @@ func (m *Module) Routes(router *httpserver.Router) {
 
 ```go
 router.Use(
-    middleware.Recovery(log.Error),   // Перехват паник
-    middleware.RequestID(),           // X-Request-ID
+    middleware.Recovery(log.Error),   // Перехват паник → 500 JSON
+    middleware.RequestID(),           // X-Request-ID генерация/проброс
     middleware.Logging(log.Info),     // Логирование запросов
 )
 ```
+
+> **Recovery и UUID-валидация:** `uuid.MustParse()` в interactor'ах паникует при невалидном ID. Middleware `Recovery` перехватывает панику и возвращает клиенту `500 Internal Error` с JSON-телом, логируя стектрейс.
 
 ### Обработчики
 
@@ -908,20 +1123,25 @@ func NewCreateTaskHandler(inter *interactor.CreateTaskInteractor) http.HandlerFu
 
 | Kind | HTTP Status |
 |------|------------|
-| `errors.Validation` | 422 Unprocessable Entity |
+| `errors.Validation` | 400 Bad Request |
 | `errors.NotFound` | 404 Not Found |
 | `errors.Conflict` | 409 Conflict |
 | `errors.DomainRule` | 422 Unprocessable Entity |
+| `errors.Infrastructure` | 503 Service Unavailable |
 
 ```go
-// Определение ошибки
+// Определение ошибки (domain/model/errors.go)
+var taskCode = errors.WithPrefix("TASK")
+
 var ErrTitleRequired = taskCode("TITLE_REQUIRED").
     Kind(errors.Validation).
     New("task title is required")
 
-// При возврате из handler → автоматически 422 с JSON:
+// При возврате из handler → автоматически 400 с JSON:
 // {"code": "TASK_TITLE_REQUIRED", "message": "task title is required"}
 ```
+
+> **Префиксы ошибок**: доменные ошибки используют префикс `TASK` (`taskCode`), API-специфичные — `TASK_API` (`apiCode`). Это позволяет различать источник ошибки в логах и ответах.
 
 ---
 
@@ -954,7 +1174,7 @@ type TaskPresenter interface {
     SetVersion(version int) TaskPresenter
 }
 
-// Агрегат заполняет presenter
+// Агрегат заполняет presenter (fluent API)
 func (t *Task) RepresentTo(p TaskPresenter) {
     p.SetID(t.id.String()).
         SetTitle(t.title.String()).
@@ -975,14 +1195,32 @@ type CreateTaskOutput struct {
     // ...
 }
 func (o *CreateTaskOutput) SetID(v string) model.TaskPresenter { o.ID = v; return o }
+```
 
-// application/business/emitter/ — для извлечения данных в event
-type taskEvent struct {
-    taskID string
-    title  string
-    // ...
+---
+
+## Structural typing для Logger
+
+Skeleton определяет собственный интерфейс логгера в `internal/logger/`:
+
+```go
+// internal/logger/logger.go
+type Logger interface {
+    Debug(msg string, args ...any)
+    Info(msg string, args ...any)
+    Warn(msg string, args ...any)
+    Error(msg string, args ...any)
 }
-func (e *taskEvent) SetID(id string) model.TaskPresenter { e.taskID = id; return e }
+```
+
+Модули зависят от **этого интерфейса**, а не от конкретного `*framework/logger.Logger`. Благодаря structural typing в Go, `*logger.Logger` из фреймворка удовлетворяет этому интерфейсу автоматически — без адаптеров, без импорта фреймворка в доменный код.
+
+```go
+// module.go — принимает интерфейс
+func NewModule(db *sql.DB, dispatcher *events.Dispatcher, log logger.Logger) *Module
+
+// bootstrap/app.go — передаёт конкретный тип
+taskMod := task.NewModule(dbm.Default(), bus.Dispatcher(), log)  // *framework/logger.Logger
 ```
 
 ---
@@ -1113,19 +1351,19 @@ POST {{BASE_URL}}/api/v1/tasks/{{TASK_ID}}/complete
 |--------|---------|
 | **Локальная разработка** | |
 | `make build` | Сборка бинарника в `bin/app` |
-| `make run` | Запуск HTTP-сервера |
-| `make run-worker` | Запуск воркера очередей |
+| `make run` | Запуск HTTP-сервера (`serve`) |
+| `make run-worker` | Запуск воркера очередей (`queue:work`) |
 | `make migrate` | Применить миграции |
 | `make migrate-down` | Откатить последнюю миграцию |
 | `make migrate-status` | Статус миграций |
 | `make migrate-plan` | План pending-миграций |
 | `make health` | Проверка здоровья |
 | `make config` | Дамп конфигурации |
-| `make test` | Запуск тестов |
-| `make lint` | Линтер (golangci-lint) |
-| `make fmt` | Форматирование кода |
+| `make test` | Запуск тестов (`-race -count=1`) |
+| `make lint` | Линтер (`golangci-lint`) |
+| `make fmt` | Форматирование кода (`gofmt` + `goimports`) |
 | **Scaffolding** | |
-| `make module` | Создать структуру нового модуля |
+| `make module` | Создать структуру нового модуля (интерактивный ввод) |
 | **Docker (production)** | |
 | `make docker-build` | Сборка Docker-образа |
 | `make docker-up` | Запуск production-стека |
@@ -1177,6 +1415,8 @@ internal/module/order/
     └── listener/
 ```
 
+> Если модуль с таким именем уже существует — команда завершится с ошибкой без перезаписи.
+
 ### 2. Определите доменную модель
 
 ```go
@@ -1185,6 +1425,19 @@ type Order struct {
     id     OrderID
     total  Money
     status Status
+    events []event.Event   // накопление доменных событий
+}
+
+func NewOrder(...) *Order {
+    order := &Order{...}
+    order.record(&event.OrderCreated{...})
+    return order
+}
+
+func (o *Order) ReleaseEvents() []event.Event {
+    evts := o.events
+    o.events = nil
+    return evts
 }
 ```
 
@@ -1199,12 +1452,14 @@ type Module struct { ... }
 func NewModule(
     db *sql.DB,
     dispatcher *events.Dispatcher,
-    log *logger.Logger,
+    log logger.Logger,             // internal/logger.Logger (structural typing)
 ) *Module { ... }
 
-func (m *Module) Routes(router *httpserver.Router)    { ... }
-func (m *Module) Listeners(d *events.Dispatcher)      { ... }
-func (m *Module) Migrations(runner *migration.Runner)  { ... }
+func (m *Module) Routes(router *httpserver.Router)           { ... }
+func (m *Module) Listeners(d *events.Dispatcher)             { ... }
+func (m *Module) Relays(relay *eventbus.OutboundRelay)       { ... }
+func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker) { ... }
+func (m *Module) Migrations(runner *migration.Runner)        { ... }
 ```
 
 ### 4. Зарегистрируйте модуль в bootstrap
@@ -1215,6 +1470,8 @@ orderMod := order.NewModule(dbm.Default(), bus.Dispatcher(), log)
 
 // В registerCommands — передайте модуль
 orderMod.Listeners(bus.Dispatcher())
+orderMod.Relays(relay)
+orderMod.Consumers(qw, broker)
 orderMod.Migrations(runner)
 ```
 
@@ -1239,4 +1496,4 @@ func buildRouter(
 
 ## Лицензия
 
-[MIT](LICENSE) © 2026 Seytumerov Mustafa
+[MIT](LICENSE) © 2025 Seytumerov Mustafa

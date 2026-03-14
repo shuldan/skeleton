@@ -1,15 +1,17 @@
 package model
 
-import "github.com/google/uuid"
-
-// TaskID — идентификатор задачи.
-type TaskID uuid.UUID
-
-// NewTaskID генерирует новый идентификатор.
-func NewTaskID() TaskID {
-	return TaskID(uuid.New())
+// TaskID — идентификатор задачи (строковое значение).
+// Генерация и парсинг UUID происходят вне пакета model.
+type TaskID struct {
+	value string
 }
 
+// NewTaskID создаёт TaskID из строки. Валидация формата — на вызывающей стороне.
+func NewTaskID(raw string) TaskID {
+	return TaskID{value: raw}
+}
+
+// String возвращает строковое представление (единственный экспортируемый метод ID).
 func (id TaskID) String() string {
-	return uuid.UUID(id).String()
+	return id.value
 }

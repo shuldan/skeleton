@@ -5,11 +5,14 @@ import (
 	"github.com/shuldan/framework/httpserver/middleware"
 	"github.com/shuldan/framework/logger"
 
+	"github.com/shuldan/skeleton/internal/module/payment"
 	"github.com/shuldan/skeleton/internal/module/task"
 )
 
 func buildRouter(
-	log *logger.Logger, taskMod *task.Module,
+	log *logger.Logger,
+	taskMod *task.Module,
+	paymentMod *payment.Module,
 ) *httpserver.Router {
 	router := httpserver.NewRouter()
 
@@ -20,6 +23,7 @@ func buildRouter(
 	)
 
 	taskMod.Routes(router)
+	paymentMod.Routes(router)
 
 	return router
 }

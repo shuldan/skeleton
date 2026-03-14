@@ -1,6 +1,8 @@
 package model
 
-import "github.com/google/uuid"
+import (
+	"github.com/shuldan/skeleton/internal/event"
+)
 
 // TaskSnapshot — плоское представление Task для персистентности.
 type TaskSnapshot struct {
@@ -22,18 +24,19 @@ func (t *Task) Snapshot() TaskSnapshot {
 	}
 }
 
-// Restore восстанавливает агрегат из снимка.
+// Restore восстанавливает агрегат из снимка без повторной валидации.
 func (s *TaskSnapshot) Restore() (*Task, error) {
-	title, err := NewTitle(s.Title)
+	t, err := NewTitle(s.Title)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Task{
-		id:          TaskID(uuid.MustParse(s.ID)),
-		title:       title,
+		id:          NewTaskID(s.ID),
+		title:       t,
 		description: s.Description,
-		status:      Status(s.Status),
+		status:      statusFromString(s.Status),
 		version:     s.Version,
+		events:      make([]event.Event, 0),
 	}, nil
 }

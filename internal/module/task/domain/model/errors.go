@@ -15,7 +15,7 @@ var (
 
 	ErrTitleRequired = taskCode("TITLE_REQUIRED").
 				Kind(errors.Validation).
-				New("task title is required")
+				New("task Title is required")
 
 	ErrConcurrentModification = taskCode("CONCURRENT_MODIFICATION").
 					Kind(errors.Conflict).

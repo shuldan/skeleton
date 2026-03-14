@@ -2,12 +2,13 @@ package model
 
 import "strings"
 
-// Title — value object заголовка задачи.
+// Title — VO заголовка задачи.
+// Все методы неэкспортируемые (требования №2, №19).
 type Title struct {
 	value string
 }
 
-// NewTitle валидирует и создаёт заголовок.
+// NewTitle валидирует формат и создаёт заголовок (требование №9, №18).
 func NewTitle(raw string) (Title, error) {
 	if strings.TrimSpace(raw) == "" {
 		return Title{}, ErrTitleRequired
@@ -16,4 +17,6 @@ func NewTitle(raw string) (Title, error) {
 	return Title{value: raw}, nil
 }
 
-func (t Title) String() string { return t.value }
+func (t Title) String() string {
+	return t.value
+}

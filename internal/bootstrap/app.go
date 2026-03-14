@@ -12,6 +12,7 @@ import (
 
 	"github.com/shuldan/framework"
 	"github.com/shuldan/framework/command"
+	"github.com/shuldan/framework/commandbus"
 	"github.com/shuldan/framework/database"
 	"github.com/shuldan/framework/eventbus"
 	"github.com/shuldan/framework/httpserver"
@@ -21,7 +22,13 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/shuldan/skeleton/internal/module/payment"
 	"github.com/shuldan/skeleton/internal/module/task"
+)
+
+const (
+	serviceName     = "task-service"
+	gracefulTimeout = 15 * time.Second
 )
 
 // Run — точка входа приложения.
@@ -42,8 +49,11 @@ func Run(ctx context.Context) error {
 	taskMod := task.NewModule(
 		dbm.Default(), bus.Dispatcher(), log,
 	)
+	paymentMod := payment.NewModule(dbm.Default(), log)
 
-	registerCommands(k, cfg, log, dbm, bus, broker, taskMod)
+	registerCommands(
+		k, cfg, log, dbm, bus, broker, taskMod, paymentMod,
+	)
 	registerShutdown(k, broker, dbm)
 
 	return k.Run(ctx, os.Args[1:])
@@ -108,33 +118,73 @@ func registerCommands(
 	bus *eventbus.Module,
 	broker queue.Broker,
 	taskMod *task.Module,
+	paymentMod *payment.Module,
 ) {
-	router := buildRouter(log, taskMod)
+	router := buildRouter(log, taskMod, paymentMod)
 
 	server := httpserver.NewModule(router, httpserver.Config{
 		Host: cfg.GetString("server.host", "0.0.0.0"),
 		Port: cfg.GetInt("server.port", 8080),
 	})
 
+	// Events: listeners
 	taskMod.Listeners(bus.Dispatcher())
 
-	relay := eventbus.NewRelay(bus.Dispatcher(), broker, log)
+	// Events: outbound relay
+	relay := eventbus.NewOutboundRelay(bus.Dispatcher(), broker, log)
 	taskMod.Relays(relay)
 
+	// Command bus: sender (task → payment)
+	sender := commandbus.NewCommandSender(broker, log,
+		commandbus.WithSender(serviceName),
+		commandbus.WithReplyTo(serviceName),
+	)
+	sender.Forward("CreateInvoice")
+	taskMod.CommandSenders(bus.Dispatcher(), sender)
+
+	// Command bus: receiver (payment handles commands)
+	receiver := commandbus.NewCommandReceiver(broker, log,
+		commandbus.WithIdempotencyTTL(24*time.Hour),
+	)
+	paymentMod.CommandHandlers(receiver)
+
+	// Command bus: reply listener (task receives results)
+	replyListener := commandbus.NewReplyListener(broker, log,
+		commandbus.WithListenerServiceName(serviceName),
+	)
+	taskMod.ReplyHandlers(replyListener)
+
+	// Queue workers
 	qw := queueworker.NewModule(log)
 	taskMod.Consumers(qw, broker)
 
+	// Command receiver consumers
+	for _, reg := range receiver.Registrations() {
+		qw.Register(reg)
+	}
+
+	// Reply listener consumer
+	qw.Register(queueworker.Registration{
+		Name: "reply-listener",
+		Run:  replyListener.Run,
+	})
+
+	// Migrations
 	runner := migration.NewRunner(
 		dbm, log, migration.WithAdvisoryLock(),
 	)
 	taskMod.Migrations(runner)
+	paymentMod.Migrations(runner)
 
 	appName := cfg.GetString("app.name", "app")
-	timeout := 15 * time.Second
 
 	k.Command(
-		command.Serve(appName, log, timeout, dbm, bus, server, qw),
-		command.QueueWork(appName, log, timeout, dbm, bus, qw),
+		command.Serve(appName, log, gracefulTimeout,
+			dbm, bus, server, qw,
+		),
+		command.QueueWork(appName, log, gracefulTimeout,
+			dbm, bus, qw,
+		),
 		command.MigrateUp(runner),
 		command.MigrateDown(runner),
 		command.MigrateStatus(runner),

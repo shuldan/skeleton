@@ -22,18 +22,18 @@ type CompleteTaskOutput interface {
 
 // CompleteTaskInteractor оркестрирует завершение задачи.
 type CompleteTaskInteractor struct {
-	completingOp     operation.CompletingOperation
-	completedEmitter emitter.EventEmitter
+	completingOp operation.CompletingOperation
+	emitter      emitter.EventEmitter
 }
 
 // NewCompleteTaskInteractor создаёт интерактор.
 func NewCompleteTaskInteractor(
 	completingOp operation.CompletingOperation,
-	completedEmitter emitter.EventEmitter,
+	emitter emitter.EventEmitter,
 ) *CompleteTaskInteractor {
 	return &CompleteTaskInteractor{
-		completingOp:     completingOp,
-		completedEmitter: completedEmitter,
+		completingOp: completingOp,
+		emitter:      emitter,
 	}
 }
 
@@ -43,15 +43,15 @@ func (i *CompleteTaskInteractor) Handle(
 	input CompleteTaskInput,
 	output CompleteTaskOutput,
 ) error {
-	taskID := model.TaskID(uuid.MustParse(input.GetTaskID()))
+	taskID := model.NewTaskID(uuid.MustParse(input.GetTaskID()).String())
 
 	task, err := i.completingOp.Complete(ctx, taskID)
 	if err != nil {
 		return err
 	}
 
+	i.emitter.Emit(ctx, task.ReleaseEvents())
 	task.RepresentTo(output)
-	i.completedEmitter.Emit(ctx, task)
 
 	return nil
 }

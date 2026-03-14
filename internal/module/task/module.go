@@ -7,12 +7,13 @@ import (
 	"github.com/shuldan/events"
 	"github.com/shuldan/queue"
 
+	"github.com/shuldan/framework/commandbus"
 	"github.com/shuldan/framework/eventbus"
 	"github.com/shuldan/framework/httpserver"
-	"github.com/shuldan/framework/logger"
 	"github.com/shuldan/framework/migration"
 	"github.com/shuldan/framework/queueworker"
 
+	"github.com/shuldan/skeleton/internal/logger"
 	"github.com/shuldan/skeleton/internal/module/task/application/business/emitter"
 	"github.com/shuldan/skeleton/internal/module/task/application/business/operation"
 	"github.com/shuldan/skeleton/internal/module/task/application/interactor"
@@ -32,38 +33,30 @@ type Module struct {
 	getInteractor      *interactor.GetTaskInteractor
 	listInteractor     *interactor.ListTasksInteractor
 	notifier           port.NotificationPort
-	logInfo            func(msg string, args ...any)
+	log                logger.Logger
 }
 
 // NewModule собирает внутренний граф зависимостей.
 func NewModule(
 	db *sql.DB,
 	dispatcher *events.Dispatcher,
-	log *logger.Logger,
+	log logger.Logger,
 ) *Module {
-	// Persistence
 	repo := persistence.NewTaskRepository(db)
-
-	// Operations
+	taskEmitter := emitter.NewTaskEmitter(dispatcher, log)
 	creatingOp := operation.NewCreatingOperation(repo)
 	completingOp := operation.NewCompletingOperation(repo)
 
-	// Emitters
-	createdEmitter := emitter.NewTaskCreatedEmitter(dispatcher)
-	completedEmitter := emitter.NewTaskCompletedEmitter(dispatcher)
-
-	// Interactors
 	createInter := interactor.NewCreateTaskInteractor(
-		creatingOp, createdEmitter,
+		creatingOp, taskEmitter,
 	)
 	completeInter := interactor.NewCompleteTaskInteractor(
-		completingOp, completedEmitter,
+		completingOp, taskEmitter,
 	)
 	getInter := interactor.NewGetTaskInteractor(repo)
 	listInter := interactor.NewListTasksInteractor(repo)
 
-	// Adapter
-	notifier := adapter.NewLoggingNotificationAdapter(log.Info)
+	notifier := adapter.NewLoggingNotificationAdapter(log)
 
 	return &Module{
 		createInteractor:   createInter,
@@ -71,7 +64,7 @@ func NewModule(
 		getInteractor:      getInter,
 		listInteractor:     listInter,
 		notifier:           notifier,
-		logInfo:            log.Info,
+		log:                log,
 	}
 }
 
@@ -89,12 +82,31 @@ func (m *Module) Routes(router *httpserver.Router) {
 
 // Listeners регистрирует подписки на события (in-process).
 func (m *Module) Listeners(d *events.Dispatcher) {
-	l := listener.NewTaskCompletedListener(m.logInfo)
+	l := listener.NewTaskCompletedListener(m.log)
 	events.Subscribe(d, l)
 }
 
+// CommandSenders регистрирует отправку команд при событиях.
+func (m *Module) CommandSenders(
+	d *events.Dispatcher, sender *commandbus.CommandSender,
+) {
+	l := listener.NewTaskCompletedCommandSender(sender, m.log)
+	events.Subscribe(d, l)
+}
+
+// ReplyHandlers регистрирует обработчики ответов на команды.
+func (m *Module) ReplyHandlers(
+	rl *commandbus.ReplyListener,
+) {
+	rl.OnResult(
+		"CreateInvoice",
+		listener.DeserializeInvoiceCreated,
+		listener.NewInvoiceCreatedReplyHandler(m.log),
+	)
+}
+
 // Relays настраивает пересылку событий в очередь.
-func (m *Module) Relays(relay *eventbus.Relay) {
+func (m *Module) Relays(relay *eventbus.OutboundRelay) {
 	relay.Forward("TaskCompleted", "task.completed",
 		eventbus.WithTransform(
 			func(e events.Event) ([]byte, error) {

@@ -3,6 +3,7 @@ package operation
 import (
 	"context"
 
+	"github.com/google/uuid"
 	domainop "github.com/shuldan/skeleton/internal/module/task/domain/business/operation"
 	"github.com/shuldan/skeleton/internal/module/task/domain/model"
 	"github.com/shuldan/skeleton/internal/module/task/domain/persistence"
@@ -25,7 +26,8 @@ func (o *CreatingOperation) Create(
 	title model.Title,
 	description string,
 ) (*model.Task, error) {
-	task := model.NewTask(title, description)
+	id := model.NewTaskID(uuid.New().String())
+	task := model.NewTask(id, title, description)
 
 	if err := o.repo.Save(ctx, task); err != nil {
 		return nil, err
