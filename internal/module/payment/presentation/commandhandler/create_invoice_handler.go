@@ -2,15 +2,12 @@ package commandhandler
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/shuldan/commands"
 
 	appcommand "github.com/shuldan/skeleton/internal/command"
 	"github.com/shuldan/skeleton/internal/module/payment/application/interactor"
 	"github.com/shuldan/skeleton/internal/module/payment/domain/model"
-
-	"github.com/shuldan/framework/commandbus"
 )
 
 // createInvoiceInput адаптирует команду к интерфейсу интерактора.
@@ -23,11 +20,11 @@ func (i *createInvoiceInput) GetAmount() int    { return i.cmd.Amount }
 
 // createInvoiceOutput реализует InvoicePresenter и собирает результат.
 type createInvoiceOutput struct {
-	ID      string `json:"invoice_id"`
-	TaskID  string `json:"task_id"`
-	Amount  int    `json:"amount"`
-	Status  string `json:"status"`
-	Version int    `json:"-"`
+	ID      string
+	TaskID  string
+	Amount  int
+	Status  string
+	Version int
 }
 
 func (o *createInvoiceOutput) SetID(v string) model.InvoicePresenter {
@@ -55,45 +52,35 @@ func (o *createInvoiceOutput) SetVersion(v int) model.InvoicePresenter {
 	return o
 }
 
-// DeserializeCreateInvoice десериализует payload в команду.
-func DeserializeCreateInvoice(
-	payload []byte, _ *commandbus.CommandEnvelope,
-) (commands.Command, error) {
-	var cmd appcommand.CreateInvoice
-	if err := json.Unmarshal(payload, &cmd); err != nil {
-		return nil, err
-	}
-
-	return &cmd, nil
-}
-
+// CreateInvoiceHandler обрабатывает команду CreateInvoice.
 type CreateInvoiceHandler struct {
 	inter *interactor.CreateInvoiceInteractor
 }
 
-func NewCreateInvoiceHandler(inter *interactor.CreateInvoiceInteractor) commandbus.CommandHandler {
-	return &CreateInvoiceHandler{
-		inter: inter,
-	}
+// NewCreateInvoiceHandler создаёт обработчик.
+func NewCreateInvoiceHandler(
+	inter *interactor.CreateInvoiceInteractor,
+) *CreateInvoiceHandler {
+	return &CreateInvoiceHandler{inter: inter}
 }
 
-func (c CreateInvoiceHandler) Handle(ctx context.Context, cmd commands.Command) (commands.Result, error) {
-	createCmd, ok := cmd.(*appcommand.CreateInvoice)
-	if !ok {
-		return nil, commands.ErrHandlerNotFound
-	}
-
+// Handle обрабатывает команду и отправляет результат через reply.
+func (h *CreateInvoiceHandler) Handle(
+	ctx context.Context,
+	cmd *appcommand.CreateInvoice,
+	reply commands.ReplySender,
+) error {
 	output := &createInvoiceOutput{}
-	input := &createInvoiceInput{cmd: createCmd}
+	input := &createInvoiceInput{cmd: cmd}
 
-	if err := c.inter.Handle(ctx, input, output); err != nil {
-		return nil, err
+	if err := h.inter.Handle(ctx, input, output); err != nil {
+		return reply.SendError(ctx, err)
 	}
 
-	return &appcommand.InvoiceCreated{
+	return reply.Send(ctx, &appcommand.InvoiceCreated{
 		InvoiceID: output.ID,
 		TaskID:    output.TaskID,
 		Amount:    output.Amount,
 		Status:    output.Status,
-	}, nil
+	})
 }

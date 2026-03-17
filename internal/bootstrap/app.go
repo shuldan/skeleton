@@ -6,7 +6,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/shuldan/commands"
+	codecjson "github.com/shuldan/commands/codec/json"
+	memorytransport "github.com/shuldan/commands/transport/memory"
 	"github.com/shuldan/config"
+	"github.com/shuldan/events"
 	"github.com/shuldan/queue"
 	memorymq "github.com/shuldan/queue/broker/memory"
 
@@ -27,7 +31,6 @@ import (
 )
 
 const (
-	serviceName     = "task-service"
 	gracefulTimeout = 15 * time.Second
 )
 
@@ -46,13 +49,38 @@ func Run(ctx context.Context) error {
 	bus := initEventBus(cfg)
 	broker := memorymq.New()
 
+	// Command bus: transport + codec.
+	transport := memorytransport.New()
+	codec := codecjson.New()
+
+	cmdClient, err := commands.NewCommandClient(transport, codec,
+		commands.WithTimeout(10*time.Second),
+	)
+	if err != nil {
+		return fmt.Errorf("command client: %w", err)
+	}
+
+	cmdServer, err := commands.NewCommandServer(transport, codec)
+	if err != nil {
+		return fmt.Errorf("command server: %w", err)
+	}
+
+	cmdModule := commandbus.NewModule(
+		commandbus.WithClient(cmdClient),
+		commandbus.WithServer(cmdServer),
+	)
+
 	taskMod := task.NewModule(
 		dbm.Default(), bus.Dispatcher(), log,
 	)
 	paymentMod := payment.NewModule(dbm.Default(), log)
 
+	// Register command handlers on server.
+	paymentMod.CommandHandlers(cmdServer)
+
 	registerCommands(
-		k, cfg, log, dbm, bus, broker, taskMod, paymentMod,
+		k, cfg, log, dbm, bus, cmdModule, broker,
+		taskMod, paymentMod, cmdClient,
 	)
 	registerShutdown(k, broker, dbm)
 
@@ -103,11 +131,19 @@ func initDatabase(
 }
 
 func initEventBus(cfg *config.Config) *eventbus.Module {
-	return eventbus.NewModule(eventbus.Config{
-		Async:      cfg.GetBool("events.async", true),
-		Workers:    cfg.GetInt("events.workers", 4),
-		BufferSize: cfg.GetInt("events.buffer_size", 128),
-	})
+	opts := make([]events.Option, 0)
+
+	if cfg.GetBool("events.async", true) {
+		opts = append(opts, events.WithAsyncMode())
+	}
+
+	if workers := cfg.GetInt("events.workers", 4); workers > 0 {
+		opts = append(opts, events.WithWorkerPool(workers))
+	}
+
+	dispatcher := events.New(opts...)
+
+	return eventbus.NewModule(dispatcher)
 }
 
 func registerCommands(
@@ -116,9 +152,11 @@ func registerCommands(
 	log *logger.Logger,
 	dbm *database.Manager,
 	bus *eventbus.Module,
+	cmdModule *commandbus.Module,
 	broker queue.Broker,
 	taskMod *task.Module,
 	paymentMod *payment.Module,
+	cmdClient *commands.CommandClient,
 ) {
 	router := buildRouter(log, taskMod, paymentMod)
 
@@ -127,49 +165,17 @@ func registerCommands(
 		Port: cfg.GetInt("server.port", 8080),
 	})
 
-	// Events: listeners
+	// Events: listeners.
 	taskMod.Listeners(bus.Dispatcher())
 
-	// Events: outbound relay
-	relay := eventbus.NewOutboundRelay(bus.Dispatcher(), broker, log)
-	taskMod.Relays(relay)
+	// Events: command senders (task → payment via command bus).
+	taskMod.CommandSenders(bus.Dispatcher(), cmdClient)
 
-	// Command bus: sender (task → payment)
-	sender := commandbus.NewCommandSender(broker, log,
-		commandbus.WithSender(serviceName),
-		commandbus.WithReplyTo(serviceName),
-	)
-	sender.Forward("CreateInvoice")
-	taskMod.CommandSenders(bus.Dispatcher(), sender)
-
-	// Command bus: receiver (payment handles commands)
-	receiver := commandbus.NewCommandReceiver(broker, log,
-		commandbus.WithIdempotencyTTL(24*time.Hour),
-	)
-	paymentMod.CommandHandlers(receiver)
-
-	// Command bus: reply listener (task receives results)
-	replyListener := commandbus.NewReplyListener(broker, log,
-		commandbus.WithListenerServiceName(serviceName),
-	)
-	taskMod.ReplyHandlers(replyListener)
-
-	// Queue workers
+	// Queue workers.
 	qw := queueworker.NewModule(log)
 	taskMod.Consumers(qw, broker)
 
-	// Command receiver consumers
-	for _, reg := range receiver.Registrations() {
-		qw.Register(reg)
-	}
-
-	// Reply listener consumer
-	qw.Register(queueworker.Registration{
-		Name: "reply-listener",
-		Run:  replyListener.Run,
-	})
-
-	// Migrations
+	// Migrations.
 	runner := migration.NewRunner(
 		dbm, log, migration.WithAdvisoryLock(),
 	)
@@ -180,10 +186,10 @@ func registerCommands(
 
 	k.Command(
 		command.Serve(appName, log, gracefulTimeout,
-			dbm, bus, server, qw,
+			dbm, bus, cmdModule, server, qw,
 		),
 		command.QueueWork(appName, log, gracefulTimeout,
-			dbm, bus, qw,
+			dbm, bus, cmdModule, qw,
 		),
 		command.MigrateUp(runner),
 		command.MigrateDown(runner),

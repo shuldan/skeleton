@@ -1,12 +1,8 @@
 package emitter
 
-import (
-	"context"
-
-	"github.com/shuldan/skeleton/internal/event"
-)
+import "context"
 
 // EventEmitter — интерфейс публикации доменных событий.
 type EventEmitter interface {
-	Emit(ctx context.Context, events []event.Event)
+	Emit(ctx context.Context, events []any)
 }

@@ -1,7 +1,5 @@
 package model
 
-import "github.com/shuldan/skeleton/internal/event"
-
 // Invoice — агрегат счёта на оплату.
 type Invoice struct {
 	id      InvoiceID
@@ -9,7 +7,6 @@ type Invoice struct {
 	amount  int
 	status  status
 	version int
-	events  []event.Event
 }
 
 // NewInvoice создаёт счёт в статусе created.
@@ -22,7 +19,6 @@ func NewInvoice(
 		amount:  amount,
 		status:  statusCreated,
 		version: 1,
-		events:  make([]event.Event, 0),
 	}
 }
 
@@ -48,11 +44,4 @@ func (i *Invoice) Snapshot() InvoiceSnapshot {
 		Status:  i.status.String(),
 		Version: i.version,
 	}
-}
-
-// ReleaseEvents возвращает накопленные события и очищает очередь.
-func (i *Invoice) ReleaseEvents() []event.Event {
-	evts := i.events
-	i.events = nil
-	return evts
 }

@@ -3,10 +3,12 @@ package payment
 import (
 	"database/sql"
 
-	"github.com/shuldan/framework/commandbus"
+	"github.com/shuldan/commands"
+
 	"github.com/shuldan/framework/httpserver"
 	"github.com/shuldan/framework/migration"
 
+	"github.com/shuldan/skeleton/internal/command"
 	"github.com/shuldan/skeleton/internal/logger"
 	"github.com/shuldan/skeleton/internal/module/payment/application/interactor"
 	invoicemigration "github.com/shuldan/skeleton/internal/module/payment/infrastructure/migration"
@@ -40,13 +42,11 @@ func (m *Module) Routes(router *httpserver.Router) {
 	group.GET("", api.NewListInvoicesHandler(m.listInteractor))
 }
 
-// CommandHandlers регистрирует обработчики команд.
-func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver) {
-	if err := receiver.Handle(
-		"CreateInvoice",
-		commandhandler.DeserializeCreateInvoice,
-		commandhandler.NewCreateInvoiceHandler(m.createInteractor),
-	); err != nil {
+// CommandHandlers регистрирует обработчики команд на сервере.
+func (m *Module) CommandHandlers(server *commands.CommandServer) {
+	handler := commandhandler.NewCreateInvoiceHandler(m.createInteractor)
+
+	if err := commands.Register[*command.CreateInvoice](server, handler); err != nil {
 		m.log.Error("failed to register command handler",
 			"command", "CreateInvoice",
 			"error", err,

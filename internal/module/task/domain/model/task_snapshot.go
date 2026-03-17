@@ -1,9 +1,5 @@
 package model
 
-import (
-	"github.com/shuldan/skeleton/internal/event"
-)
-
 // TaskSnapshot — плоское представление Task для персистентности.
 type TaskSnapshot struct {
 	ID          string
@@ -37,6 +33,6 @@ func (s *TaskSnapshot) Restore() (*Task, error) {
 		description: s.Description,
 		status:      statusFromString(s.Status),
 		version:     s.Version,
-		events:      make([]event.Event, 0),
+		events:      make([]any, 0),
 	}, nil
 }

@@ -1,7 +1,6 @@
 package model
 
 import (
-	"github.com/shuldan/events"
 	"github.com/shuldan/skeleton/internal/event"
 )
 
@@ -12,7 +11,7 @@ type Task struct {
 	description string
 	status      status
 	version     int
-	events      []event.Event
+	events      []any
 }
 
 // NewTask создаёт задачу в статусе draft.
@@ -23,13 +22,12 @@ func NewTask(id TaskID, title Title, description string) *Task {
 		description: description,
 		status:      statusDraft,
 		version:     1,
-		events:      make([]event.Event, 0),
+		events:      make([]any, 0),
 	}
 
 	task.record(&event.TaskCreated{
-		BaseEvent: events.NewBaseEvent("TaskCreated", task.id.String()),
-		TaskID:    task.id.String(),
-		Title:     title.String(),
+		TaskID: task.id.String(),
+		Title:  title.String(),
 	})
 
 	return task
@@ -47,8 +45,7 @@ func (t *Task) Complete() error {
 	t.status = newStatus
 
 	t.record(&event.TaskCompleted{
-		BaseEvent: events.NewBaseEvent("TaskCompleted", t.id.String()),
-		TaskID:    t.id.String(),
+		TaskID: t.id.String(),
 	})
 
 	return nil
@@ -64,12 +61,12 @@ func (t *Task) RepresentTo(p TaskPresenter) {
 }
 
 // ReleaseEvents возвращает накопленные события и очищает очередь.
-func (t *Task) ReleaseEvents() []event.Event {
+func (t *Task) ReleaseEvents() []any {
 	evts := t.events
 	t.events = nil
 	return evts
 }
 
-func (t *Task) record(e event.Event) {
+func (t *Task) record(e any) {
 	t.events = append(t.events, e)
 }

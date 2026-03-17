@@ -1,3 +1,4 @@
+shuldan/skeleton/README.md
 # Skeleton — Go Application Template
 
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev)
@@ -37,17 +38,15 @@
   - [Накопление событий в агрегате](#накопление-событий-в-агрегате)
   - [Emitter (публикация)](#emitter-публикация)
   - [Listener (подписка)](#listener-подписка)
-  - [OutboundRelay (пересылка в очередь)](#outboundrelay-пересылка-в-очередь)
   - [Полный цикл события в task-модуле](#полный-цикл-события-в-task-модуле)
 - [Командная шина (Command Bus)](#командная-шина-command-bus)
   - [Обзор](#обзор)
   - [Определение команд и результатов](#определение-команд-и-результатов)
-  - [CommandSender (отправка)](#commandsender-отправка)
-  - [CommandReceiver (обработка)](#commandreceiver-обработка)
-  - [ReplyListener (получение результатов)](#replylistener-получение-результатов)
+  - [Отправка команд (CommandClient)](#отправка-команд-commandclient)
+  - [Обработка команд (CommandServer)](#обработка-команд-commandserver)
+  - [Получение результатов (Future)](#получение-результатов-future)
   - [Регистрация в bootstrap](#регистрация-в-bootstrap)
   - [Полный цикл команды](#полный-цикл-команды)
-  - [Идемпотентность](#идемпотентность)
   - [Когда использовать Command Bus vs Events](#когда-использовать-command-bus-vs-events)
 - [Очереди](#очереди)
 - [HTTP-сервер](#http-сервер)
@@ -193,7 +192,7 @@ sequenceDiagram
     O-->>I: *Task, error
     I->>I: task.RepresentTo(output)
     I->>I: task.ReleaseEvents()
-    I->>E: emitter.Emit(ctx, []event.Event)
+    I->>E: emitter.Emit(ctx, []any)
     E->>D: dispatcher.Publish(ctx, event) × N
     I-->>H: nil / error
     H->>C: JSON Response
@@ -204,25 +203,19 @@ sequenceDiagram
 ```mermaid
 graph LR
     AGG["Aggregate<br/><i>record(event)</i>"] --> INT["Interactor<br/><i>ReleaseEvents()</i>"]
-    INT --> EM["Emitter<br/><i>[]event.Event</i>"]
+    INT --> EM["Emitter<br/><i>[]any</i>"]
     EM --> DISP["Dispatcher"]
     
     DISP --> L1["Listener<br/><i>in-process</i>"]
-    DISP --> RELAY["OutboundRelay"]
     DISP --> CMDSEND["CommandSender<br/><i>→ Command Bus</i>"]
-    RELAY --> BROKER["Broker<br/><i>memory / redis / ...</i>"]
-    CMDSEND --> BROKER
-    BROKER --> JOB["Job / Consumer<br/><i>async worker</i>"]
-    BROKER --> CMDRECV["CommandReceiver<br/><i>другой модуль</i>"]
+    DISP --> JOB["Job Consumer<br/><i>async worker</i>"]
 
     style AGG fill:#fff3e0
     style INT fill:#e8f5e9
     style DISP fill:#fff3e0
     style L1 fill:#f3e5f5
-    style BROKER fill:#e1f5fe
-    style JOB fill:#fce4ec
     style CMDSEND fill:#e8eaf6
-    style CMDRECV fill:#e8eaf6
+    style JOB fill:#fce4ec
 ```
 
 **Поток событий:**
@@ -230,11 +223,9 @@ graph LR
 1. Агрегат **накапливает** события через `record()` при изменении состояния
 2. Interactor вызывает `task.ReleaseEvents()` — забирает и очищает очередь
 3. Emitter итерирует по слайсу и публикует каждое событие в Dispatcher
-4. Dispatcher доставляет события в:
+4. Dispatcher доставляет события подписчикам:
    - **Listener** (in-process обработка)
-   - **OutboundRelay** (→ очередь для async consumers)
    - **CommandSender** (→ Command Bus для межмодульных команд)
-5. Job/Consumer и CommandReceiver читают из очереди и обрабатывают асинхронно
 
 ### Командная шина
 
@@ -242,39 +233,36 @@ graph LR
 graph LR
     subgraph "Модуль-отправитель (task)"
         EVT["TaskCompleted<br/><i>событие</i>"]
-        CS["CommandSender"]
+        CL["CommandClient"]
     end
     
-    EVT --> CS
-    CS -->|"Command Envelope"| BRK["Broker<br/><i>queue topic</i>"]
+    EVT --> CL
+    CL -->|"CommandEnvelope"| TR["Transport<br/><i>memory / NATS / ...</i>"]
     
     subgraph "Модуль-получатель (payment)"
-        CR["CommandReceiver"]
-        CH["CommandHandler"]
+        SRV["CommandServer"]
+        CH["Handler[C]"]
         INTER["Interactor"]
     end
     
-    BRK --> CR
-    CR --> CH
+    TR --> SRV
+    SRV --> CH
     CH --> INTER
-    INTER -->|"Result"| CR
-    CR -->|"Reply Envelope"| BRK
+    INTER -->|"Result via ReplySender"| CH
+    CH -->|"ReplyEnvelope"| TR
     
     subgraph "Модуль-отправитель (task)"
-        RL["ReplyListener"]
-        RH["ReplyHandler"]
+        FUT["Future / TypedFuture"]
     end
     
-    BRK --> RL
-    RL --> RH
+    TR --> FUT
 
     style EVT fill:#fff3e0
-    style CS fill:#e8eaf6
-    style BRK fill:#e1f5fe
-    style CR fill:#e8eaf6
+    style CL fill:#e8eaf6
+    style TR fill:#e1f5fe
+    style SRV fill:#e8eaf6
     style CH fill:#f3e5f5
-    style RL fill:#e8eaf6
-    style RH fill:#f3e5f5
+    style FUT fill:#e8eaf6
 ```
 
 ### Принципы
@@ -287,8 +275,8 @@ graph LR
 | **Presenter-паттерн** | Домен не знает о JSON/HTTP; данные передаются через `TaskPresenter` |
 | **Snapshot-паттерн** | Персистентность через плоские снимки агрегата, без экспорта приватных полей |
 | **CQRS-lite** | Разделение операций записи (operations/interactors) и чтения |
-| **Event-Driven** | Агрегат накапливает события → emitter публикует пакетом → relay пересылает в очередь |
-| **Command Bus** | Межмодульное взаимодействие через команды с гарантированной доставкой и ответом |
+| **Event-Driven** | Агрегат накапливает события → emitter публикует пакетом |
+| **Command Bus** | Межмодульное взаимодействие через `CommandClient` / `CommandServer` с `Future` |
 | **Structural typing** | Модули определяют свой `Logger` интерфейс, совместимый с `framework/logger` без импорта |
 
 ---
@@ -315,8 +303,8 @@ skeleton/
 │   │   └── invoice.go               # Определения команд и результатов (Command Bus)
 │   │
 │   ├── event/
-│   │   ├── event.go                 # Интерфейс Event (доменная граница)
-│   │   └── task.go                  # Глобальные определения событий
+│   │   ├── event.go                 # Пакет доменных событий
+│   │   └── task.go                  # Структуры событий задачи
 │   │
 │   ├── logger/
 │   │   └── logger.go                # Интерфейс Logger (structural typing)
@@ -329,7 +317,7 @@ skeleton/
 │       │   ├── infrastructure/
 │       │   └── presentation/
 │       │       ├── api/             # HTTP handlers
-│       │       ├── listener/        # Event listeners + CommandSender + ReplyHandler
+│       │       ├── listener/        # Event listeners + CommandClient sender
 │       │       └── job/             # Queue consumers
 │       │
 │       └── payment/                  # ── Модуль Payment (получатель команд) ──
@@ -372,7 +360,7 @@ graph TB
 
         subgraph presentation
             API["api/<br/>HTTP handlers"]
-            LST["listener/<br/>event handlers +<br/>command senders +<br/>reply handlers"]
+            LST["listener/<br/>event handlers +<br/>command senders"]
             JOB["job/<br/>queue consumers"]
         end
 
@@ -456,7 +444,7 @@ type Task struct {
     description string
     status      status
     version     int
-    events      []event.Event   // очередь доменных событий
+    events      []any   // очередь доменных событий
 }
 
 // Конструктор — создаёт задачу и записывает событие TaskCreated
@@ -466,9 +454,8 @@ func NewTask(id TaskID, title Title, description string) *Task {
         status: statusDraft, version: 1,
     }
     task.record(&event.TaskCreated{
-        BaseEvent: events.NewBaseEvent("TaskCreated", task.id.String()),
-        TaskID:    task.id.String(),
-        Title:     title.String(),
+        TaskID: task.id.String(),
+        Title:  title.String(),
     })
     return task
 }
@@ -480,23 +467,25 @@ func (t *Task) Complete() error {
         return err
     }
     t.status = newStatus
-    t.record(&event.TaskCompleted{...})
+    t.record(&event.TaskCompleted{TaskID: t.id.String()})
     return nil
 }
 
 // ReleaseEvents — забирает накопленные события и очищает очередь
-func (t *Task) ReleaseEvents() []event.Event {
+func (t *Task) ReleaseEvents() []any {
     evts := t.events
     t.events = nil
     return evts
 }
 
-func (t *Task) record(e event.Event) {
+func (t *Task) record(e any) {
     t.events = append(t.events, e)
 }
 ```
 
 > **Паттерн:** события не публикуются немедленно. Агрегат накапливает их через `record()`, а interactor забирает пакетом через `ReleaseEvents()` после успешного сохранения. Это гарантирует, что события публикуются только при успешной операции.
+
+> **`events.Event` — это `any`:** библиотека `shuldan/events` определяет `Event` как `any`, поэтому доменные события — простые структуры без обязательных методов. Агрегат хранит `[]any`.
 
 **Value objects** содержат валидацию при создании:
 
@@ -592,19 +581,14 @@ func (o *CreatingOperation) Create(
 }
 ```
 
-**Emitter** — единый для всех событий агрегата. Принимает слайс событий и публикует каждое в Dispatcher:
+**Emitter** — единый для всех событий агрегата. Принимает слайс `[]any` и публикует каждый элемент в Dispatcher:
 
 ```go
-func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
+func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []any) {
     publishCtx := context.WithoutCancel(ctx)  // события отправляются даже при отмене запроса
 
     for _, ev := range domainEvents {
-        dispatchable, ok := ev.(events.Event)
-        if !ok {
-            e.log.Error("event does not implement events.Event", ...)
-            continue
-        }
-        if err := e.dispatcher.Publish(publishCtx, dispatchable); err != nil {
+        if err := e.dispatcher.Publish(publishCtx, ev); err != nil {
             e.log.Error("failed to emit event", ...)
         }
     }
@@ -612,8 +596,6 @@ func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
 ```
 
 > **`context.WithoutCancel`**: emitter публикует события в контексте, не привязанном к HTTP-запросу. Если клиент отключился, события всё равно доставляются подписчикам.
-
-> **Граница доменного и инфраструктурного события:** домен работает с интерфейсом `event.Event` (определён в `internal/event`), а emitter кастит к `events.Event` из библиотеки для публикации через Dispatcher. Домен не зависит от инфраструктурной библиотеки событий.
 
 **Port** — интерфейс к внешней системе, реализуемый в infrastructure:
 
@@ -686,8 +668,7 @@ presentation/
 │   └── errors.go                  # API-специфичные ошибки
 ├── listener/
 │   ├── task_completed_listener.go         # In-process обработка TaskCompleted
-│   ├── task_completed_command_sender.go   # Отправка CreateInvoice через Command Bus
-│   └── invoice_created_reply_handler.go   # Обработка результата CreateInvoice
+│   └── task_completed_command_sender.go   # Отправка CreateInvoice через CommandClient
 ├── commandhandler/                        # (в модуле payment)
 │   └── create_invoice_handler.go          # Обработка команды CreateInvoice
 └── job/
@@ -728,9 +709,7 @@ func NewModule(db *sql.DB, dispatcher *events.Dispatcher, log logger.Logger) *Mo
 // Регистрация компонентов — вызываются из bootstrap
 func (m *Module) Routes(router *httpserver.Router)
 func (m *Module) Listeners(d *events.Dispatcher)
-func (m *Module) CommandSenders(d *events.Dispatcher, sender *commandbus.CommandSender)
-func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener)
-func (m *Module) Relays(relay *eventbus.OutboundRelay)
+func (m *Module) CommandSenders(client *commands.CommandClient)
 func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker)
 func (m *Module) Migrations(runner *migration.Runner)
 ```
@@ -740,7 +719,7 @@ func (m *Module) Migrations(runner *migration.Runner)
 ```go
 func NewModule(db *sql.DB, log logger.Logger) *Module
 func (m *Module) Routes(router *httpserver.Router)
-func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver)
+func (m *Module) CommandHandlers(server *commands.CommandServer)
 func (m *Module) Migrations(runner *migration.Runner)
 ```
 
@@ -925,7 +904,7 @@ repo := repository.New(
 
 ## События
 
-Система событий состоит из трёх уровней:
+Система событий состоит из двух уровней:
 
 ```mermaid
 graph LR
@@ -933,59 +912,45 @@ graph LR
         AGG["Aggregate<br/>record()"] --> REL["ReleaseEvents()"]
     end
 
-    subgraph "Синхронно (in-process)"
-        REL --> EM["Emitter<br/>[]event.Event"]
+    subgraph "In-process (Dispatcher)"
+        REL --> EM["Emitter<br/>[]any"]
         EM --> DISP["Dispatcher"]
         DISP --> LST["Listener"]
         DISP --> CMDSND["CommandSender"]
-    end
-
-    subgraph "Асинхронно (через очередь)"
-        DISP --> RLY["OutboundRelay"]
-        CMDSND --> BRK["Broker"]
-        RLY --> BRK
-        BRK --> JOB["Job"]
-        BRK --> CMDRCV["CommandReceiver"]
     end
 
     style AGG fill:#fff3e0
     style EM fill:#e8f5e9
     style DISP fill:#fff3e0
     style LST fill:#f3e5f5
-    style BRK fill:#e1f5fe
-    style JOB fill:#fce4ec
     style CMDSND fill:#e8eaf6
-    style CMDRCV fill:#e8eaf6
 ```
 
 ### Определение событий
 
-Глобальные структуры событий объявляются в `internal/event/`:
+События — простые структуры в `internal/event/`. Библиотека `shuldan/events` определяет `Event` как `any`, поэтому никаких обязательных методов реализовывать не нужно:
 
 ```go
-// internal/event/event.go — доменная граница событий
-type Event interface {
-    EventName() string
-    OccurredAt() time.Time
-    AggregateID() string
-}
-```
+// internal/event/task.go
 
-```go
-// internal/event/task.go — конкретные события
+// TaskCreated публикуется при создании задачи.
 type TaskCreated struct {
-    events.BaseEvent
     TaskID string `json:"task_id"`
     Title  string `json:"title"`
 }
 
+// EventKey реализует events.KeyedEvent для упорядоченной обработки.
+func (e *TaskCreated) EventKey() string { return e.TaskID }
+
+// TaskCompleted публикуется при завершении задачи.
 type TaskCompleted struct {
-    events.BaseEvent
     TaskID string `json:"task_id"`
 }
+
+func (e *TaskCompleted) EventKey() string { return e.TaskID }
 ```
 
-> **Граница:** домен зависит от `internal/event.Event` (свой интерфейс), а не от `shuldan/events.Event` (библиотека). Emitter в application-слое кастит к библиотечному типу при публикации. Так домен остаётся независимым от инфраструктуры.
+> **`EventKey()`** — опциональный метод. Если событие реализует `events.KeyedEvent`, Dispatcher гарантирует, что события с одинаковым ключом обрабатываются последовательно (ordering).
 
 ### Накопление событий в агрегате
 
@@ -996,9 +961,8 @@ type TaskCompleted struct {
 func NewTask(id TaskID, title Title, description string) *Task {
     task := &Task{...}
     task.record(&event.TaskCreated{
-        BaseEvent: events.NewBaseEvent("TaskCreated", task.id.String()),
-        TaskID:    task.id.String(),
-        Title:     title.String(),
+        TaskID: task.id.String(),
+        Title:  title.String(),
     })
     return task
 }
@@ -1010,15 +974,12 @@ func (t *Task) Complete() error {
         return err
     }
     t.status = newStatus
-    t.record(&event.TaskCompleted{
-        BaseEvent: events.NewBaseEvent("TaskCompleted", t.id.String()),
-        TaskID:    t.id.String(),
-    })
+    t.record(&event.TaskCompleted{TaskID: t.id.String()})
     return nil
 }
 
 // ReleaseEvents — interactor забирает события после успешного сохранения
-func (t *Task) ReleaseEvents() []event.Event {
+func (t *Task) ReleaseEvents() []any {
     evts := t.events
     t.events = nil
     return evts
@@ -1029,19 +990,14 @@ func (t *Task) ReleaseEvents() []event.Event {
 
 ### Emitter (публикация)
 
-Единый emitter принимает **слайс событий** и публикует каждое в Dispatcher:
+Единый emitter принимает **слайс `[]any`** и публикует каждый элемент в Dispatcher:
 
 ```go
-func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
+func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []any) {
     publishCtx := context.WithoutCancel(ctx)
 
     for _, ev := range domainEvents {
-        dispatchable, ok := ev.(events.Event)
-        if !ok {
-            e.log.Error("event does not implement events.Event", ...)
-            continue
-        }
-        if err := e.dispatcher.Publish(publishCtx, dispatchable); err != nil {
+        if err := e.dispatcher.Publish(publishCtx, ev); err != nil {
             e.log.Error("failed to emit event", ...)
         }
     }
@@ -1053,21 +1009,21 @@ func (e *TaskEmitter) Emit(ctx context.Context, domainEvents []event.Event) {
 | Решение | Причина |
 |---------|---------|
 | `context.WithoutCancel(ctx)` | Клиент отключился — события всё равно доставляются |
-| Один emitter на агрегат | Проще, чем per-event emitter. Новое событие = 0 новых файлов в emitter |
-| Каст `event.Event` → `events.Event` | Домен не зависит от библиотеки; адаптация на границе |
+| Один emitter на агрегат | Проще, чем per-event emitter. Новое событие = 0 новых файлов |
+| `[]any` в интерфейсе | Совпадает с `events.Event = any` — нет каста |
 
 **Доменный интерфейс:**
 
 ```go
 // domain/business/emitter/event_emitter.go
 type EventEmitter interface {
-    Emit(ctx context.Context, events []event.Event)
+    Emit(ctx context.Context, events []any)
 }
 ```
 
 ### Listener (подписка)
 
-In-process подписка через типизированный `Subscribe`:
+In-process подписка через типизированный `events.Subscribe`:
 
 ```go
 // presentation/listener/task_completed_listener.go
@@ -1082,32 +1038,13 @@ func (l *TaskCompletedListener) Handle(
     return nil
 }
 
-// module.go — регистрация struct-based listener
+// module.go — регистрация
 func (m *Module) Listeners(d *events.Dispatcher) {
     events.Subscribe(d, listener.NewTaskCompletedListener(m.log))
 }
 ```
 
-> **`events.Subscribe` vs `events.SubscribeFunc`**: skeleton использует struct-based `Subscribe` — listener реализует `Handle(ctx, *EventType) error`. Для простых случаев можно использовать `SubscribeFunc` с замыканием.
-
-### OutboundRelay (пересылка в очередь)
-
-Для асинхронной обработки события пересылаются из Dispatcher в message broker через `OutboundRelay`:
-
-```go
-func (m *Module) Relays(relay *eventbus.OutboundRelay) {
-    relay.Forward("TaskCompleted", "task.completed",
-        eventbus.WithTransform(func(e events.Event) ([]byte, error) {
-            return json.Marshal(map[string]string{
-                "task_id": e.AggregateID(),
-                "event":   e.EventName(),
-            })
-        }),
-    )
-}
-```
-
-> **`WithTransform` vs Envelope:** по умолчанию `OutboundRelay` оборачивает события в стандартный `Envelope` (см. документацию фреймворка). `WithTransform` обходит Envelope и позволяет задать кастомную сериализацию. Используйте `WithTransform` для простых случаев или интеграции со сторонними системами; Envelope — для межсервисной коммуникации с трассировкой.
+> **Типизация:** `events.Subscribe` использует дженерики — обработчик получает конкретный тип `*event.TaskCompleted`, а не `any`. Маршрутизация по типу событий происходит автоматически через `reflect.TypeFor[E]()`.
 
 ### Полный цикл события в task-модуле
 
@@ -1121,12 +1058,11 @@ sequenceDiagram
     participant E as Emitter
     participant D as Dispatcher
     participant L as Listener (in-process)
-    participant CS as CommandSender
-    participant RL as OutboundRelay
-    participant B as Broker
-    participant CR as CommandReceiver
-    participant J as Job (async)
-    participant N as NotificationPort
+    participant CS as CommandSender (listener)
+    participant CL as CommandClient
+    participant TR as Transport
+    participant SRV as CommandServer
+    participant PH as Payment Handler
 
     H->>I: Handle(ctx, input, output)
     I->>O: Complete(ctx, taskID)
@@ -1141,16 +1077,15 @@ sequenceDiagram
     par In-process
         D->>L: Handle(TaskCompleted)
     and Command Bus
-        D->>CS: Handle(TaskCompleted) → Send(CreateInvoice)
-        CS->>B: Produce(command envelope)
-        B->>CR: Consume → Handle(CreateInvoice)
-        CR->>B: Produce(reply envelope)
-        B->>I2: ReplyListener → callback
-    and Async Queue
-        D->>RL: Forward → transform → Produce
-        RL->>B: Produce("task.completed", data)
-        B->>J: Consume("task.completed")
-        J->>N: Send(taskID, message)
+        D->>CS: Handle(TaskCompleted)
+        CS->>CL: commands.Send[*InvoiceCreated](ctx, client, cmd)
+        CL->>TR: Send(CommandEnvelope)
+        TR->>SRV: dispatch → Handler.Handle(ctx, cmd, reply)
+        SRV->>PH: Handle(ctx, CreateInvoice, reply)
+        PH->>PH: reply.Send(ctx, InvoiceCreated)
+        PH-->>TR: ReplyEnvelope
+        TR-->>CL: handleReply → future.complete()
+        CL-->>CS: future.Await() → InvoiceCreated
     end
     
     I->>T: RepresentTo(output)
@@ -1164,59 +1099,56 @@ sequenceDiagram
 
 ### Обзор
 
-Командная шина обеспечивает **межмодульное взаимодействие** с семантикой **запрос-ответ** (request/reply). В отличие от событий (fire-and-forget уведомления), команды:
+Командная шина обеспечивает **межмодульное взаимодействие** с семантикой **запрос-ответ** (request/reply). Построена на абстракциях `Transport` и `Codec` из пакета `shuldan/commands`:
 
-- Имеют **конкретного получателя** (один обработчик на команду)
-- Возвращают **результат** или ошибку
-- Поддерживают **идемпотентность** (повторная отправка не дублирует эффект)
-- Доставляются **асинхронно** через брокер сообщений
+- **`CommandClient`** — отправляет команды и получает `Future` с результатом
+- **`CommandServer`** — принимает команды и вызывает типизированные обработчики
+- **`Transport`** — абстракция транспорта (in-memory, NATS, RabbitMQ и т.д.)
+- **`Codec`** — сериализация/десериализация (JSON, Protobuf и т.д.)
 
 ```mermaid
 graph TB
     subgraph "Отправитель (task module)"
         EVT["TaskCompleted<br/><i>событие</i>"]
-        SEND["CommandSender<br/><i>сериализация + envelope</i>"]
+        LST["Listener"]
+        CL["CommandClient<br/><i>Send → Future</i>"]
     end
 
     subgraph "Транспорт"
-        BRK["Broker<br/><i>command topic</i>"]
-        REPLY["Broker<br/><i>reply topic</i>"]
+        TR["Transport<br/><i>memory / NATS / ...</i>"]
     end
 
     subgraph "Получатель (payment module)"
-        RECV["CommandReceiver<br/><i>десериализация + dispatch</i>"]
-        HANDLER["CommandHandler<br/><i>бизнес-логика</i>"]
+        SRV["CommandServer"]
+        HDL["Handler[*CreateInvoice]"]
+        INTER["Interactor"]
+        RS["ReplySender"]
     end
 
-    subgraph "Обратная связь (task module)"
-        RL["ReplyListener<br/><i>десериализация результата</i>"]
-        CB["ResultCallback<br/><i>обработка ответа</i>"]
-    end
-
-    EVT -->|"listener"| SEND
-    SEND -->|"Command Envelope"| BRK
-    BRK --> RECV
-    RECV --> HANDLER
-    HANDLER -->|"Result"| RECV
-    RECV -->|"Reply Envelope"| REPLY
-    REPLY --> RL
-    RL --> CB
+    EVT -->|"Subscribe"| LST
+    LST -->|"commands.Send"| CL
+    CL -->|"CommandEnvelope"| TR
+    TR -->|"dispatch"| SRV
+    SRV --> HDL
+    HDL --> INTER
+    INTER --> HDL
+    HDL -->|"reply.Send(result)"| RS
+    RS -->|"ReplyEnvelope"| TR
+    TR -->|"future.complete"| CL
 
     style EVT fill:#fff3e0
-    style SEND fill:#e8eaf6
-    style BRK fill:#e1f5fe
-    style REPLY fill:#e1f5fe
-    style RECV fill:#e8eaf6
-    style HANDLER fill:#f3e5f5
-    style RL fill:#e8eaf6
-    style CB fill:#f3e5f5
+    style CL fill:#e8eaf6
+    style TR fill:#e1f5fe
+    style SRV fill:#e8eaf6
+    style HDL fill:#f3e5f5
+    style RS fill:#e8eaf6
 ```
 
-Skeleton демонстрирует полный цикл на примере:
+Skeleton демонстрирует полный цикл:
 - **Task** завершается → событие `TaskCompleted`
-- Listener отправляет команду `CreateInvoice` через Command Bus
-- **Payment** модуль получает команду, создаёт счёт, возвращает результат
-- **Task** модуль получает результат `InvoiceCreated` и логирует его
+- Listener отправляет команду `CreateInvoice` через `CommandClient`
+- **Payment** модуль получает команду, создаёт счёт, отправляет результат через `ReplySender`
+- **Task** модуль получает результат `InvoiceCreated` через `TypedFuture`
 
 ### Определение команд и результатов
 
@@ -1225,16 +1157,15 @@ Skeleton демонстрирует полный цикл на примере:
 ```go
 // internal/command/invoice.go
 
-// CreateInvoice — команда создания счёта при завершении задачи.
+// CreateInvoice — команда создания счёта.
 type CreateInvoice struct {
     TaskID string `json:"task_id"`
     Amount int    `json:"amount"`
 }
 
-func (c *CreateInvoice) CommandName() string    { return "CreateInvoice" }
-func (c *CreateInvoice) IdempotencyKey() string { return "invoice-" + c.TaskID }
+func (c *CreateInvoice) CommandName() string { return "CreateInvoice" }
 
-// InvoiceCreated — результат успешного создания счёта.
+// InvoiceCreated — результат успешного создания.
 type InvoiceCreated struct {
     InvoiceID string `json:"invoice_id"`
     TaskID    string `json:"task_id"`
@@ -1245,24 +1176,22 @@ type InvoiceCreated struct {
 func (r *InvoiceCreated) ResultName() string { return "InvoiceCreated" }
 ```
 
-**Интерфейсы, которые необходимо реализовать:**
+**Интерфейсы из `shuldan/commands`:**
 
 | Интерфейс | Методы | Назначение |
 |-----------|--------|-----------|
-| `commands.Command` | `CommandName()`, `IdempotencyKey()` | Идентификация команды и ключ идемпотентности |
-| `commands.Result` | `ResultName()` | Идентификация результата |
+| `commands.Command` | `CommandName() string` | Идентификация команды для маршрутизации |
+| `commands.Result` | `ResultName() string` | Идентификация результата для десериализации |
 
-> **`IdempotencyKey()`** — ключ, по которому CommandReceiver определяет повторные команды. В примере `"invoice-" + TaskID` гарантирует, что для одной задачи создаётся максимум один счёт.
+### Отправка команд (CommandClient)
 
-### CommandSender (отправка)
-
-CommandSender сериализует команду, оборачивает в envelope и отправляет в брокер. Подписка как listener на доменное событие:
+Команды отправляются через `CommandClient`. Типизированная функция `commands.Send[R]` возвращает `TypedFuture[R]`:
 
 ```go
 // presentation/listener/task_completed_command_sender.go
 
 type TaskCompletedCommandSender struct {
-    sender *commandbus.CommandSender
+    client *commands.CommandClient
     log    logger.Logger
 }
 
@@ -1274,15 +1203,29 @@ func (l *TaskCompletedCommandSender) Handle(
         Amount: 100,
     }
 
-    if err := l.sender.Send(ctx, cmd); err != nil {
-        l.log.Error("failed to send CreateInvoice command",
-            "task_id", e.TaskID,
-            "error", err,
-        )
+    // Типизированная отправка — возвращает TypedFuture[*InvoiceCreated]
+    future, err := commands.Send[*appcommand.InvoiceCreated](
+        ctx, l.client, cmd,
+    )
+    if err != nil {
+        l.log.Error("failed to send CreateInvoice command", ...)
         return err
     }
 
-    l.log.Info("CreateInvoice command sent", "task_id", e.TaskID)
+    // Обработка результата асинхронно
+    go func() {
+        result, awaitErr := future.Await(context.Background())
+        if awaitErr != nil {
+            l.log.Error("CreateInvoice command failed", ...)
+            return
+        }
+
+        l.log.Info("invoice created via command bus",
+            "invoice_id", result.InvoiceID,
+            "task_id",    result.TaskID,
+        )
+    }()
+
     return nil
 }
 ```
@@ -1291,189 +1234,160 @@ func (l *TaskCompletedCommandSender) Handle(
 
 ```go
 // module.go (task)
-
-// CommandSenders регистрирует отправку команд при событиях.
 func (m *Module) CommandSenders(
-    d *events.Dispatcher, sender *commandbus.CommandSender,
+    d *events.Dispatcher, client *commands.CommandClient,
 ) {
-    l := listener.NewTaskCompletedCommandSender(sender, m.log)
+    l := listener.NewTaskCompletedCommandSender(client, m.log)
     events.Subscribe(d, l)
 }
 ```
 
-> **Паттерн:** CommandSender — это обычный event listener. Он подписывается на доменное событие и реагирует отправкой команды. Это позволяет модулю-отправителю не знать о модуле-получателе напрямую.
+> **`commands.Send[R]` vs `client.Send`**: типизированная функция `commands.Send[*InvoiceCreated]` автоматически десериализует результат в нужный тип через `Codec`. Нетипизированный `client.Send` возвращает `Future` с `Result` интерфейсом.
 
-### CommandReceiver (обработка)
+> **`Future.Await`** блокируется до получения ответа или таймаута. По умолчанию таймаут 30 секунд (настраивается через `commands.WithTimeout`).
 
-CommandReceiver десериализует команду из брокера и передаёт обработчику. Обработчик реализует интерфейс `commandbus.CommandHandler`:
+### Обработка команд (CommandServer)
+
+Обработчик реализует `commands.Handler[C]` и регистрируется на `CommandServer`:
 
 ```go
 // presentation/commandhandler/create_invoice_handler.go (payment module)
 
-// Десериализация payload → Command
-func DeserializeCreateInvoice(
-    payload []byte, _ *commandbus.CommandEnvelope,
-) (commands.Command, error) {
-    var cmd appcommand.CreateInvoice
-    if err := json.Unmarshal(payload, &cmd); err != nil {
-        return nil, err
-    }
-    return &cmd, nil
-}
-
-// Обработчик команды
 type CreateInvoiceHandler struct {
     inter *interactor.CreateInvoiceInteractor
 }
 
-func (c CreateInvoiceHandler) Handle(
-    ctx context.Context, cmd commands.Command,
-) (commands.Result, error) {
-    createCmd, ok := cmd.(*appcommand.CreateInvoice)
-    if !ok {
-        return nil, commands.ErrHandlerNotFound
-    }
-
+func (h *CreateInvoiceHandler) Handle(
+    ctx context.Context,
+    cmd *appcommand.CreateInvoice,    // типизированная команда
+    reply commands.ReplySender,       // для отправки ответа
+) error {
     output := &createInvoiceOutput{}
-    input := &createInvoiceInput{cmd: createCmd}
+    input := &createInvoiceInput{cmd: cmd}
 
-    if err := c.inter.Handle(ctx, input, output); err != nil {
-        return nil, err
+    if err := h.inter.Handle(ctx, input, output); err != nil {
+        return reply.SendError(ctx, err)  // ошибка → ErrorPayload
     }
 
-    return &appcommand.InvoiceCreated{
+    return reply.Send(ctx, &appcommand.InvoiceCreated{
         InvoiceID: output.ID,
         TaskID:    output.TaskID,
         Amount:    output.Amount,
         Status:    output.Status,
-    }, nil
+    })
 }
 ```
 
-**Регистрация в модуле:**
+**Регистрация через дженерик `commands.Register`:**
 
 ```go
 // module.go (payment)
+func (m *Module) CommandHandlers(server *commands.CommandServer) {
+    handler := commandhandler.NewCreateInvoiceHandler(m.createInteractor)
 
-// CommandHandlers регистрирует обработчики команд.
-func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver) {
-    if err := receiver.Handle(
-        "CreateInvoice",
-        commandhandler.DeserializeCreateInvoice,
-        commandhandler.NewCreateInvoiceHandler(m.createInteractor),
-    ); err != nil {
+    if err := commands.Register[*command.CreateInvoice](server, handler); err != nil {
         m.log.Error("failed to register command handler", ...)
     }
 }
 ```
 
-> **Адаптация Input/Output:** Command handler создаёт адаптеры `createInvoiceInput` и `createInvoiceOutput`, которые реализуют интерфейсы интерактора. Interactor не знает, что его вызывают из Command Bus, а не из HTTP handler'а.
+> **`commands.Register[C]`** автоматически десериализует payload в тип `C` через `Codec` и маршрутизирует по `CommandName()`. Один обработчик на одну команду.
 
-### ReplyListener (получение результатов)
+> **`ReplySender`** — отправляет результат обратно клиенту. `Send` для успешного результата, `SendError` для ошибки. Ответ автоматически доставляется через `Transport` к `Future` на стороне клиента.
 
-ReplyListener подписывается на topic ответов и вызывает callback при получении результата:
+### Получение результатов (Future)
+
+`Future` / `TypedFuture` — механизм получения результата команды:
 
 ```go
-// presentation/listener/invoice_created_reply_handler.go (task module)
-
-// Десериализация результата
-func DeserializeInvoiceCreated(
-    payload []byte, _ *commandbus.ResultEnvelope,
-) (commands.Result, error) {
-    var result appcommand.InvoiceCreated
-    if err := json.Unmarshal(payload, &result); err != nil {
-        return nil, err
-    }
-    return &result, nil
-}
-
-// Callback обработки результата
-func NewInvoiceCreatedReplyHandler(
-    log logger.Logger,
-) commandbus.ResultCallbackFunc {
-    return func(
-        _ context.Context,
-        result commands.Result,
-        err error,
-    ) error {
-        if err != nil {
-            log.Error("CreateInvoice command failed", "error", err)
-            return nil
-        }
-
-        invoiceResult, ok := result.(*appcommand.InvoiceCreated)
-        if !ok {
-            log.Error("unexpected result type for CreateInvoice")
-            return nil
-        }
-
-        log.Info("invoice created via command bus",
-            "invoice_id", invoiceResult.InvoiceID,
-            "task_id",    invoiceResult.TaskID,
-            "amount",     invoiceResult.Amount,
-            "status",     invoiceResult.Status,
-        )
-        return nil
-    }
+// TypedFuture[R] — типобезопасный future
+type TypedFuture[R Result] interface {
+    Await(ctx context.Context) (R, error)     // блокируется до результата
+    Done() <-chan struct{}                     // канал завершения
+    Result() (R, error, bool)                 // неблокирующая проверка
 }
 ```
 
-**Регистрация в модуле:**
+**Варианты использования:**
 
 ```go
-// module.go (task)
+// 1. Блокирующее ожидание
+result, err := future.Await(ctx)
 
-// ReplyHandlers регистрирует обработчики ответов на команды.
-func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener) {
-    rl.OnResult(
-        "CreateInvoice",
-        listener.DeserializeInvoiceCreated,
-        listener.NewInvoiceCreatedReplyHandler(m.log),
-    )
+// 2. Ожидание с таймаутом
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+result, err := future.Await(ctx)
+
+// 3. Асинхронная обработка
+go func() {
+    result, err := future.Await(context.Background())
+    // ...
+}()
+
+// 4. Неблокирующая проверка
+if result, err, ok := future.Result(); ok {
+    // результат готов
+}
+
+// 5. Select
+select {
+case <-future.Done():
+    result, err, _ := future.Result()
+    // ...
+case <-ctx.Done():
+    // таймаут
 }
 ```
+
+> **Таймаут:** если ответ не получен за `defaultTimeout` (30 сек), future завершается с `commands.ErrTimeout`. Настраивается через `commands.WithTimeout()` при создании клиента или `commands.WithSendTimeout()` при отправке.
 
 ### Регистрация в bootstrap
 
 Все компоненты Command Bus собираются в `bootstrap/app.go`:
 
 ```go
-func registerCommands(...) {
-    // 1. CommandSender: сериализация команд → брокер
-    sender := commandbus.NewCommandSender(broker, log,
-        commandbus.WithSender(serviceName),     // имя сервиса-отправителя
-        commandbus.WithReplyTo(serviceName),     // куда слать ответ
+func Run(ctx context.Context) error {
+    // ...
+
+    // 1. Transport — абстракция доставки (in-memory для одного процесса)
+    transport := memorytransport.New()
+
+    // 2. Codec — сериализация (JSON)
+    codec := codecjson.New()
+
+    // 3. CommandClient — отправитель команд
+    cmdClient, err := commands.NewCommandClient(transport, codec,
+        commands.WithTimeout(10*time.Second),
     )
-    sender.Forward("CreateInvoice")              // регистрация маршрута команды
-    taskMod.CommandSenders(bus.Dispatcher(), sender)
 
-    // 2. CommandReceiver: брокер → десериализация → обработчик
-    receiver := commandbus.NewCommandReceiver(broker, log,
-        commandbus.WithIdempotencyTTL(24*time.Hour),  // TTL дедупликации
+    // 4. CommandServer — получатель команд
+    cmdServer, err := commands.NewCommandServer(transport, codec)
+
+    // 5. Регистрация обработчиков ДО открытия сервера
+    paymentMod.CommandHandlers(cmdServer)
+
+    // 6. Модуль жизненного цикла (Open/Close)
+    cmdModule := commandbus.NewModule(
+        commandbus.WithClient(cmdClient),
+        commandbus.WithServer(cmdServer),
     )
-    paymentMod.CommandHandlers(receiver)
 
-    // 3. ReplyListener: получение результатов
-    replyListener := commandbus.NewReplyListener(broker, log,
-        commandbus.WithListenerServiceName(serviceName),
-    )
-    taskMod.ReplyHandlers(replyListener)
+    // 7. Регистрация event listener для отправки команд
+    taskMod.CommandSenders(bus.Dispatcher(), cmdClient)
 
-    // 4. Регистрация consumer'ов в queue worker
-    qw := queueworker.NewModule(log)
-
-    // Command receiver consumers (один на каждую зарегистрированную команду)
-    for _, reg := range receiver.Registrations() {
-        qw.Register(reg)
-    }
-
-    // Reply listener consumer
-    qw.Register(queueworker.Registration{
-        Name: "reply-listener",
-        Run:  replyListener.Run,
-    })
+    // ...
 }
 ```
+
+**Порядок инициализации:**
+
+1. Создать `Transport` и `Codec`
+2. Создать `CommandClient` и `CommandServer`
+3. Зарегистрировать обработчики на сервере (`commands.Register`)
+4. Обернуть в `commandbus.Module` (управление жизненным циклом)
+5. `Module.Start` вызовет `server.Open` и `client.Open`
+6. `Module.Stop` вызовет `client.Close` и `server.Close`
 
 ### Полный цикл команды
 
@@ -1481,74 +1395,41 @@ func registerCommands(...) {
 sequenceDiagram
     participant T as Task Module
     participant D as Dispatcher
-    participant CS as CommandSender
-    participant B as Broker
-    participant CR as CommandReceiver
-    participant P as Payment Module
-    participant RL as ReplyListener
-    participant CB as ResultCallback
+    participant LS as Listener (sender)
+    participant CL as CommandClient
+    participant TR as Transport
+    participant SRV as CommandServer
+    participant HDL as Handler[CreateInvoice]
+    participant RS as ReplySender
+    participant FUT as TypedFuture
 
     Note over T: task.Complete() → TaskCompleted
     T->>D: Publish(TaskCompleted)
-    D->>CS: Handle(TaskCompleted)
-    CS->>CS: CreateInvoice{TaskID, Amount}
-    CS->>CS: Serialize → Command Envelope
-    CS->>B: Produce("cmd.CreateInvoice", envelope)
+    D->>LS: Handle(TaskCompleted)
+    LS->>CL: commands.Send[*InvoiceCreated](ctx, client, cmd)
+    CL->>CL: codec.Encode(cmd) → payload
+    CL->>CL: Store future by correlationID
+    CL->>TR: Send(CommandEnvelope)
+    CL-->>LS: TypedFuture[*InvoiceCreated]
     
-    Note over B: Асинхронная доставка
+    Note over TR: Доставка через Transport
     
-    B->>CR: Consume("cmd.CreateInvoice")
-    CR->>CR: Deserialize → CreateInvoice
-    CR->>CR: Check idempotency key
-    CR->>P: Handle(CreateInvoice)
-    P->>P: CreateInvoiceInteractor.Handle()
-    P-->>CR: InvoiceCreated{InvoiceID, ...}
-    CR->>CR: Serialize → Reply Envelope
-    CR->>B: Produce("reply.task-service", envelope)
+    TR->>SRV: dispatch(CommandEnvelope)
+    SRV->>SRV: codec.Decode(payload) → *CreateInvoice
+    SRV->>HDL: Handle(ctx, *CreateInvoice, reply)
+    HDL->>HDL: interactor.Handle(ctx, input, output)
+    HDL->>RS: reply.Send(ctx, InvoiceCreated)
+    RS->>RS: codec.Encode(result) → payload
+    RS->>TR: Reply(ReplyEnvelope)
     
-    B->>RL: Consume("reply.task-service")
-    RL->>RL: Deserialize → InvoiceCreated
-    RL->>CB: callback(InvoiceCreated, nil)
-    CB->>CB: Log: "invoice created"
+    TR->>CL: handleReply(ReplyEnvelope)
+    CL->>CL: Lookup future by correlationID
+    CL->>CL: codec.Decode(payload) → *InvoiceCreated
+    CL->>FUT: complete(InvoiceCreated)
+    
+    Note over LS: Асинхронно
+    LS->>FUT: future.Await(ctx) → *InvoiceCreated, nil
 ```
-
-### Идемпотентность
-
-Команды поддерживают идемпотентность через `IdempotencyKey()`:
-
-```go
-func (c *CreateInvoice) IdempotencyKey() string {
-    return "invoice-" + c.TaskID
-}
-```
-
-CommandReceiver хранит обработанные ключи с TTL:
-
-```go
-receiver := commandbus.NewCommandReceiver(broker, log,
-    commandbus.WithIdempotencyTTL(24*time.Hour),  // ключ хранится 24 часа
-)
-```
-
-При повторном получении команды с тем же `IdempotencyKey`:
-- Команда **не обрабатывается повторно**
-- Возвращается **закешированный результат** (если есть)
-
-Дополнительно, интерактор payment-модуля проверяет наличие существующего счёта:
-
-```go
-func (i *CreateInvoiceInteractor) Handle(ctx, input, output) error {
-    // Проверяем, не создан ли уже счёт для этой задачи
-    existing, _ := i.repo.FindByTaskID(ctx, input.GetTaskID())
-    if existing != nil {
-        existing.RepresentTo(output)
-        return nil  // возвращаем существующий, не создаём дубликат
-    }
-    // ... создание нового счёта
-}
-```
-
-> **Два уровня защиты:** идемпотентность на уровне транспорта (CommandReceiver) + бизнес-идемпотентность на уровне домена (проверка в интеракторе).
 
 ### Когда использовать Command Bus vs Events
 
@@ -1556,9 +1437,10 @@ func (i *CreateInvoiceInteractor) Handle(ctx, input, output) error {
 |---------------|--------|-------------|
 | **Семантика** | «Что-то произошло» (уведомление) | «Сделай это» (запрос) |
 | **Получатели** | 0..N подписчиков | Ровно 1 обработчик |
-| **Ответ** | Нет (fire-and-forget) | Есть (Result или ошибка) |
-| **Связанность** | Слабая (отправитель не знает о подписчиках) | Средняя (отправитель знает имя команды) |
-| **Идемпотентность** | На стороне подписчика | Встроенная (IdempotencyKey + TTL) |
+| **Ответ** | Нет (fire-and-forget) | Есть (`Future` с `Result` или ошибкой) |
+| **Связанность** | Слабая (отправитель не знает о подписчиках) | Средняя (отправитель знает имя команды и тип результата) |
+| **Таймаут** | Нет | Встроенный (настраиваемый) |
+| **Типобезопасность** | Дженерики на подписке | Дженерики на отправке и обработке |
 | **Примеры** | Логирование, метрики, уведомления | Создание связанных сущностей, платежи |
 
 **В skeleton оба механизма работают вместе:**
@@ -1568,19 +1450,16 @@ graph LR
     TC["TaskCompleted<br/><i>событие</i>"]
     
     TC --> L1["Listener<br/><i>логирование</i>"]
-    TC --> CS["CommandSender<br/><i>CreateInvoice</i>"]
-    TC --> RL["OutboundRelay<br/><i>уведомление</i>"]
+    TC --> CS["CommandSender<br/><i>CreateInvoice → Future</i>"]
     
     style TC fill:#fff3e0
     style L1 fill:#f3e5f5
     style CS fill:#e8eaf6
-    style RL fill:#e1f5fe
 ```
 
 Одно событие `TaskCompleted` порождает:
 1. **Listener** — синхронное логирование (in-process)
-2. **CommandSender** — создание счёта в payment-модуле (Command Bus)
-3. **OutboundRelay** — пересылка в очередь для async notification job
+2. **CommandSender** — создание счёта в payment-модуле (Command Bus с `Future`)
 
 ---
 
@@ -1620,7 +1499,7 @@ make run-worker
 go run ./cmd/app queue:work
 ```
 
-> **`serve` vs `queue:work`**: команда `serve` запускает HTTP-сервер **и** воркеры очередей (включая Command Bus consumers). Команда `queue:work` запускает **только** воркеры (без HTTP). Используйте `queue:work` для выделенных worker-нод.
+> **`serve` vs `queue:work`**: команда `serve` запускает HTTP-сервер **и** воркеры очередей. Команда `queue:work` запускает **только** воркеры (без HTTP). Используйте `queue:work` для выделенных worker-нод.
 
 ---
 
@@ -1711,7 +1590,7 @@ graph TB
     AGG["Task aggregate<br/><i>приватные поля</i>"] -->|RepresentTo| PI["TaskPresenter<br/><i>интерфейс</i>"]
 
     PI --> HTTP["CreateTaskOutput<br/><i>JSON struct</i>"]
-    PI --> CMD["createInvoiceOutput<br/><i>Command Bus result</i>"]
+    PI --> CMD["createInvoiceOutput<br/><i>Command handler</i>"]
     PI --> TEST["mockPresenter<br/><i>для тестов</i>"]
 
     style AGG fill:#fff3e0
@@ -1755,8 +1634,8 @@ func (o *CreateTaskOutput) SetID(v string) model.TaskPresenter { o.ID = v; retur
 
 // presentation/commandhandler/ — для результата команды
 type createInvoiceOutput struct {
-    ID     string `json:"invoice_id"`
-    TaskID string `json:"task_id"`
+    ID     string
+    TaskID string
     // ...
 }
 func (o *createInvoiceOutput) SetID(v string) model.InvoicePresenter { o.ID = v; return o }
@@ -1926,7 +1805,7 @@ GET {{BASE_URL}}/api/v1/invoices
 | `make run` | Запуск HTTP-сервера (`serve`) |
 | `make run-worker` | Запуск воркера очередей (`queue:work`) |
 | `make migrate` | Применить миграции |
-| `make migrate-down` | Откатить последнюю миграцию |
+| `make migrate-down` | Откатить последнюю |
 | `make migrate-status` | Статус миграций |
 | `make migrate-plan` | План pending-миграций |
 | `make health` | Проверка здоровья |
@@ -1997,7 +1876,7 @@ type Order struct {
     id     OrderID
     total  Money
     status Status
-    events []event.Event   // накопление доменных событий
+    events []any   // накопление доменных событий
 }
 
 func NewOrder(...) *Order {
@@ -2006,7 +1885,7 @@ func NewOrder(...) *Order {
     return order
 }
 
-func (o *Order) ReleaseEvents() []event.Event {
+func (o *Order) ReleaseEvents() []any {
     evts := o.events
     o.events = nil
     return evts
@@ -2029,22 +1908,20 @@ func NewModule(
     log logger.Logger,
 ) *Module { ... }
 
-func (m *Module) Routes(router *httpserver.Router)           { ... }
-func (m *Module) Listeners(d *events.Dispatcher)             { ... }
-func (m *Module) CommandSenders(d *events.Dispatcher, sender *commandbus.CommandSender)  { ... }
-func (m *Module) ReplyHandlers(rl *commandbus.ReplyListener) { ... }
-func (m *Module) Relays(relay *eventbus.OutboundRelay)       { ... }
-func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker) { ... }
-func (m *Module) Migrations(runner *migration.Runner)        { ... }
+func (m *Module) Routes(router *httpserver.Router)
+func (m *Module) Listeners(d *events.Dispatcher)
+func (m *Module) CommandSenders(d *events.Dispatcher, client *commands.CommandClient)
+func (m *Module) Consumers(qw *queueworker.Module, broker queue.Broker)
+func (m *Module) Migrations(runner *migration.Runner)
 ```
 
 Для модулей-получателей команд:
 
 ```go
-func NewModule(db *sql.DB, log logger.Logger) *Module { ... }
-func (m *Module) Routes(router *httpserver.Router)                      { ... }
-func (m *Module) CommandHandlers(receiver *commandbus.CommandReceiver)   { ... }
-func (m *Module) Migrations(runner *migration.Runner)                   { ... }
+func NewModule(db *sql.DB, log logger.Logger) *Module
+func (m *Module) Routes(router *httpserver.Router)
+func (m *Module) CommandHandlers(server *commands.CommandServer)
+func (m *Module) Migrations(runner *migration.Runner)
 ```
 
 ### 4. Зарегистрируйте модуль в bootstrap
@@ -2053,11 +1930,9 @@ func (m *Module) Migrations(runner *migration.Runner)                   { ... }
 // internal/bootstrap/app.go — в функции Run
 orderMod := order.NewModule(dbm.Default(), bus.Dispatcher(), log)
 
-// В registerCommands — передайте модуль
+// В registerCommands
 orderMod.Listeners(bus.Dispatcher())
-orderMod.CommandSenders(bus.Dispatcher(), sender)
-orderMod.ReplyHandlers(replyListener)
-orderMod.Relays(relay)
+orderMod.CommandSenders(bus.Dispatcher(), cmdClient)
 orderMod.Consumers(qw, broker)
 orderMod.Migrations(runner)
 ```
@@ -2090,8 +1965,7 @@ type CreateShipment struct {
     Address string `json:"address"`
 }
 
-func (c *CreateShipment) CommandName() string    { return "CreateShipment" }
-func (c *CreateShipment) IdempotencyKey() string { return "shipment-" + c.OrderID }
+func (c *CreateShipment) CommandName() string { return "CreateShipment" }
 
 type ShipmentCreated struct {
     ShipmentID string `json:"shipment_id"`

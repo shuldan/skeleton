@@ -5,7 +5,6 @@ import (
 
 	"github.com/shuldan/events"
 
-	appevent "github.com/shuldan/skeleton/internal/event"
 	"github.com/shuldan/skeleton/internal/logger"
 	domainemitter "github.com/shuldan/skeleton/internal/module/task/domain/business/emitter"
 )
@@ -28,22 +27,14 @@ func NewTaskEmitter(
 }
 
 func (e *TaskEmitter) Emit(
-	ctx context.Context, domainEvents []appevent.Event,
+	ctx context.Context, domainEvents []any,
 ) {
 	publishCtx := context.WithoutCancel(ctx)
 
 	for _, ev := range domainEvents {
-		dispatchable, ok := ev.(events.Event)
-		if !ok {
-			e.log.Error("event does not implement events.Event",
-				"event_name", ev.EventName(),
-			)
-			continue
-		}
-
-		if err := e.dispatcher.Publish(publishCtx, dispatchable); err != nil {
+		if err := e.dispatcher.Publish(publishCtx, ev); err != nil {
 			e.log.Error("failed to emit event",
-				"event_name", ev.EventName(),
+				"event", ev,
 				"error", err,
 			)
 		}

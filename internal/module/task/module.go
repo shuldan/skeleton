@@ -2,13 +2,11 @@ package task
 
 import (
 	"database/sql"
-	"encoding/json"
 
+	"github.com/shuldan/commands"
 	"github.com/shuldan/events"
 	"github.com/shuldan/queue"
 
-	"github.com/shuldan/framework/commandbus"
-	"github.com/shuldan/framework/eventbus"
 	"github.com/shuldan/framework/httpserver"
 	"github.com/shuldan/framework/migration"
 	"github.com/shuldan/framework/queueworker"
@@ -88,35 +86,10 @@ func (m *Module) Listeners(d *events.Dispatcher) {
 
 // CommandSenders регистрирует отправку команд при событиях.
 func (m *Module) CommandSenders(
-	d *events.Dispatcher, sender *commandbus.CommandSender,
+	d *events.Dispatcher, client *commands.CommandClient,
 ) {
-	l := listener.NewTaskCompletedCommandSender(sender, m.log)
+	l := listener.NewTaskCompletedCommandSender(client, m.log)
 	events.Subscribe(d, l)
-}
-
-// ReplyHandlers регистрирует обработчики ответов на команды.
-func (m *Module) ReplyHandlers(
-	rl *commandbus.ReplyListener,
-) {
-	rl.OnResult(
-		"CreateInvoice",
-		listener.DeserializeInvoiceCreated,
-		listener.NewInvoiceCreatedReplyHandler(m.log),
-	)
-}
-
-// Relays настраивает пересылку событий в очередь.
-func (m *Module) Relays(relay *eventbus.OutboundRelay) {
-	relay.Forward("TaskCompleted", "task.completed",
-		eventbus.WithTransform(
-			func(e events.Event) ([]byte, error) {
-				return json.Marshal(map[string]string{
-					"task_id": e.AggregateID(),
-					"event":   e.EventName(),
-				})
-			},
-		),
-	)
 }
 
 // Consumers регистрирует consumer-ов очередей.

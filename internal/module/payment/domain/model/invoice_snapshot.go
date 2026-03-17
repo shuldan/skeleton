@@ -1,7 +1,5 @@
 package model
 
-import "github.com/shuldan/skeleton/internal/event"
-
 // InvoiceSnapshot — плоское представление Invoice для персистентности.
 type InvoiceSnapshot struct {
 	ID      string
@@ -19,6 +17,5 @@ func (s *InvoiceSnapshot) Restore() *Invoice {
 		amount:  s.Amount,
 		status:  statusFromString(s.Status),
 		version: s.Version,
-		events:  make([]event.Event, 0),
 	}
 }
